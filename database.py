@@ -24,6 +24,7 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "megaform.db")
 LOCAL_USER_ID = "local-user"
 SECRET_PREFIX = "enc:v1:"
 SECRET_KEY_PATH = Path(__file__).with_name(".megaform_secret.key")
+PROFILE_VERSION_RETENTION = 10
 
 
 
@@ -42,6 +43,26 @@ def new_id() -> str:
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _trim_user_profile_versions(conn: sqlite3.Connection, user_id: str) -> None:
+    conn.execute(
+        """DELETE FROM user_profile_versions
+           WHERE user_id=?
+             AND id NOT IN (
+                 SELECT id
+                   FROM user_profile_versions
+                  WHERE user_id=?
+                  ORDER BY created_at DESC, rowid DESC
+                  LIMIT ?
+             )""",
+        (user_id, user_id, PROFILE_VERSION_RETENTION),
+    )
+
+
+def _trim_all_user_profile_versions(conn: sqlite3.Connection) -> None:
+    for row in conn.execute("SELECT DISTINCT user_id FROM user_profile_versions").fetchall():
+        _trim_user_profile_versions(conn, row["user_id"])
 
 
 def _load_secret_material() -> bytes:
@@ -115,6 +136,102 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     if not _table_exists(conn, table):
         return set()
     return {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _parse_meta_obj_for_migration(raw) -> dict:
+    meta = raw or "{}"
+    for _ in range(2):
+        if isinstance(meta, dict):
+            return meta
+        if not isinstance(meta, str):
+            return {}
+        try:
+            meta = json.loads(meta)
+        except Exception:
+            return {}
+    return meta if isinstance(meta, dict) else {}
+
+
+def _infer_model_image_input_capability(provider: str, base_url: str, model_name: str) -> bool:
+    provider_l = (provider or "").lower()
+    base_l = (base_url or "").lower()
+    name = (model_name or "").lower().removeprefix("models/")
+    short_name = name.split("/", 1)[1] if "/" in name else name
+
+    if "generativelanguage.googleapis.com" in base_l or "gemini" in short_name:
+        return "embedding" not in short_name
+
+    if provider_l == "anthropic" or short_name.startswith("claude-") or name.startswith("anthropic/claude"):
+        return (
+            short_name.startswith("claude-3")
+            or short_name.startswith("claude-opus-4")
+            or short_name.startswith("claude-sonnet-4")
+            or short_name.startswith("claude-haiku-4")
+            or short_name.startswith("claude-4")
+        )
+
+    openai_like = provider_l == "openai" or "api.openai.com" in base_l or name.startswith("openai/")
+    if openai_like:
+        if short_name.startswith((
+            "gpt-5",
+            "gpt-4.5",
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4-turbo",
+            "gpt-4-vision",
+            "o1",
+            "o3",
+            "o4",
+        )):
+            return True
+
+    qwen_like = provider_l in {"qwen", "dashscope"} or "dashscope" in base_l or name.startswith("qwen/")
+    if qwen_like:
+        return "omni" in short_name or "-vl" in short_name or "vision" in short_name
+
+    zhipu_like = provider_l in {"zhipu", "bigmodel"} or "bigmodel.cn" in base_l
+    if zhipu_like:
+        return "glm" in short_name and ("-v" in short_name or "4v" in short_name or "vision" in short_name)
+
+    if "openrouter.ai" in base_l or provider_l == "openrouter":
+        return (
+            name.startswith("google/gemini")
+            or name.startswith("anthropic/claude")
+            or name.startswith("openai/gpt-5")
+            or name.startswith("openai/gpt-4.5")
+            or name.startswith("openai/gpt-4.1")
+            or name.startswith("openai/gpt-4o")
+            or name.startswith("openai/o1")
+            or name.startswith("openai/o3")
+            or name.startswith("openai/o4")
+            or ("qwen" in name and ("omni" in name or "-vl" in name or "vision" in name))
+        )
+
+    return False
+
+
+def _patch_model_image_input_capabilities(conn: sqlite3.Connection) -> None:
+    if not _table_exists(conn, "model_configs"):
+        return
+    rows = conn.execute("SELECT id, provider, base_url, model_name, meta FROM model_configs").fetchall()
+    patched = 0
+    for row in rows:
+        meta = _parse_meta_obj_for_migration(row["meta"])
+        capabilities = meta.get("capabilities")
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+        if "image_input" in capabilities:
+            continue
+        if not _infer_model_image_input_capability(row["provider"], row["base_url"], row["model_name"]):
+            continue
+        meta["capabilities"] = {**capabilities, "image_input": True}
+        conn.execute(
+            "UPDATE model_configs SET meta=? WHERE id=?",
+            (json.dumps(meta, ensure_ascii=False), row["id"]),
+        )
+        patched += 1
+    if patched:
+        log.info("迁移: 为 %d 个存量模型补充图片输入能力标记", patched)
 
 
 def _create_nodes_table(conn: sqlite3.Connection):
@@ -296,7 +413,19 @@ def init_db():
             summary         TEXT DEFAULT '',
             pinned          INTEGER DEFAULT 0,
             archived        INTEGER DEFAULT 0,
+            group_id        TEXT REFERENCES root_groups(id) ON DELETE SET NULL,
+            group_order     INTEGER,
             meta            TEXT DEFAULT '{}',
+            created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS root_groups (
+            id              TEXT PRIMARY KEY,
+            user_id         TEXT NOT NULL DEFAULT 'local-user' REFERENCES users(id) ON DELETE CASCADE,
+            name            TEXT NOT NULL,
+            sort_order      INTEGER NOT NULL DEFAULT 0,
+            collapsed       INTEGER DEFAULT 0,
             created_at      TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
         );
@@ -337,6 +466,7 @@ def init_db():
             name             TEXT NOT NULL,
             provider         TEXT NOT NULL,
             base_url         TEXT,
+            proxy_url        TEXT,
             api_key          TEXT,
             model_name       TEXT NOT NULL,
             max_tokens       INTEGER DEFAULT 4096,
@@ -524,6 +654,7 @@ def init_db():
             log.info("FTS: responses_fts 已重建")
     except Exception as e:
         log.warning("FTS: 重建检查失败: %s", e)
+    _trim_all_user_profile_versions(conn)
     conn.commit()
     conn.close()
     log.debug("数据库 Schema 初始化完成")
@@ -559,6 +690,9 @@ def migrate_schema():
         if "output_tokens" not in cols:
             conn.execute("ALTER TABLE model_configs ADD COLUMN output_tokens INTEGER DEFAULT 0")
             log.info("迁移: model_configs 新增 output_tokens 字段")
+        if "proxy_url" not in cols:
+            conn.execute("ALTER TABLE model_configs ADD COLUMN proxy_url TEXT DEFAULT ''")
+            log.info("迁移: model_configs 新增 proxy_url 字段")
 
         # V7→V8: nodes 新增 summary 字段
         node_cols = _columns(conn, "nodes")
@@ -571,6 +705,24 @@ def migrate_schema():
         if "archived" not in node_cols:
             conn.execute("ALTER TABLE nodes ADD COLUMN archived INTEGER DEFAULT 0")
             log.info("迁移: nodes 新增 archived 字段")
+        if "group_id" not in node_cols:
+            conn.execute("ALTER TABLE nodes ADD COLUMN group_id TEXT REFERENCES root_groups(id) ON DELETE SET NULL")
+            log.info("迁移: nodes 新增 group_id 字段")
+        if "group_order" not in node_cols:
+            conn.execute("ALTER TABLE nodes ADD COLUMN group_order INTEGER")
+            log.info("迁移: nodes 新增 group_order 字段")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS root_groups (
+                id              TEXT PRIMARY KEY,
+                user_id         TEXT NOT NULL DEFAULT 'local-user' REFERENCES users(id) ON DELETE CASCADE,
+                name            TEXT NOT NULL,
+                sort_order      INTEGER NOT NULL DEFAULT 0,
+                collapsed       INTEGER DEFAULT 0,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            )
+        """)
 
         user_cols = _columns(conn, "users")
         if user_cols and "password_hash" not in user_cols:
@@ -645,6 +797,8 @@ def migrate_schema():
                 ON users(lower(email))
                 WHERE email IS NOT NULL AND email != '';
             CREATE INDEX IF NOT EXISTS idx_nodes_user_root ON nodes(user_id, root_id);
+            CREATE INDEX IF NOT EXISTS idx_nodes_user_group_order ON nodes(user_id, group_id, group_order);
+            CREATE INDEX IF NOT EXISTS idx_root_groups_user_order ON root_groups(user_id, sort_order);
             CREATE INDEX IF NOT EXISTS idx_responses_user_node ON responses(user_id, node_id);
             CREATE INDEX IF NOT EXISTS idx_nuts_user_response ON nuts(user_id, response_id);
             CREATE INDEX IF NOT EXISTS idx_model_configs_user ON model_configs(user_id, name);
@@ -709,6 +863,8 @@ def migrate_schema():
             CREATE INDEX IF NOT EXISTS idx_user_profile_versions_user_created
                 ON user_profile_versions(user_id, created_at DESC);
         """)
+        _patch_model_image_input_capabilities(conn)
+        _trim_all_user_profile_versions(conn)
     finally:
         conn.commit()
         conn.close()
@@ -779,6 +935,13 @@ def get_user(user_id: str) -> Optional[dict]:
     row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def list_users() -> list[dict]:
+    conn = get_db()
+    rows = conn.execute("SELECT * FROM users ORDER BY created_at").fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
 
 
 def get_user_by_email(email: str) -> Optional[dict]:
@@ -1011,6 +1174,7 @@ def get_user_profile(user_id: str = LOCAL_USER_ID) -> dict:
                VALUES (?, ?, ?, ?, ?)""",
             (user_id, DEFAULT_PROFILE_MD, version_id, now, now),
         )
+        _trim_user_profile_versions(conn, user_id)
         conn.commit()
         row = conn.execute("SELECT * FROM user_profiles WHERE user_id=?", (user_id,)).fetchone()
     conn.close()
@@ -1024,6 +1188,8 @@ def save_user_profile(content: str, user_id: str = LOCAL_USER_ID, note: str = ""
     now = _now()
 
     if existing and (existing["content"] or "") == normalized:
+        _trim_user_profile_versions(conn, user_id)
+        conn.commit()
         conn.close()
         return dict(existing)
 
@@ -1046,6 +1212,7 @@ def save_user_profile(content: str, user_id: str = LOCAL_USER_ID, note: str = ""
                VALUES (?, ?, ?, ?, ?)""",
             (user_id, normalized, version_id, now, now),
         )
+    _trim_user_profile_versions(conn, user_id)
     conn.commit()
     row = conn.execute("SELECT * FROM user_profiles WHERE user_id=?", (user_id,)).fetchone()
     conn.close()
@@ -1054,13 +1221,15 @@ def save_user_profile(content: str, user_id: str = LOCAL_USER_ID, note: str = ""
 
 def list_user_profile_versions(user_id: str = LOCAL_USER_ID, limit: int = 50) -> list[dict]:
     conn = get_db()
+    _trim_user_profile_versions(conn, user_id)
+    conn.commit()
     rows = conn.execute(
         """SELECT id, user_id, content, note, created_at
            FROM user_profile_versions
            WHERE user_id=?
-           ORDER BY created_at DESC
+           ORDER BY created_at DESC, rowid DESC
            LIMIT ?""",
-        (user_id, max(1, min(int(limit or 50), 200))),
+        (user_id, max(1, min(int(limit or PROFILE_VERSION_RETENTION), PROFILE_VERSION_RETENTION))),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -1083,7 +1252,7 @@ def restore_user_profile_version(version_id: str, user_id: str = LOCAL_USER_ID) 
 # ═══════════════════════════════════════════════
 
 def get_all_roots(user_id: str | None = LOCAL_USER_ID) -> list[dict]:
-    """获取所有问题树根节点，置顶优先，再按更新时间倒序。"""
+    """获取所有问题树根节点，按分组和对话更新时间返回。"""
     conn = get_db()
     user_filter = "" if user_id is None else "AND root.user_id=?"
     params = [] if user_id is None else [user_id]
@@ -1093,11 +1262,121 @@ def get_all_roots(user_id: str | None = LOCAL_USER_ID) -> list[dict]:
            LEFT JOIN nodes AS child ON child.root_id = root.id AND child.user_id = root.user_id
            WHERE root.parent_id IS NULL {user_filter}
            GROUP BY root.id
-           ORDER BY root.pinned DESC, root.updated_at DESC"""
+           ORDER BY root.group_id IS NOT NULL,
+                    root.group_id,
+                    root.updated_at DESC"""
         , params
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_root_groups(user_id: str = LOCAL_USER_ID) -> list[dict]:
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM root_groups WHERE user_id=? ORDER BY sort_order, created_at",
+        (user_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def create_root_group(name: str, user_id: str = LOCAL_USER_ID) -> dict:
+    conn = get_db()
+    gid = new_id()
+    now = _now()
+    row = conn.execute(
+        "SELECT MAX(sort_order) AS m FROM root_groups WHERE user_id=?",
+        (user_id,),
+    ).fetchone()
+    sort_order = (row["m"] if row and row["m"] is not None else -1) + 1
+    conn.execute(
+        """INSERT INTO root_groups
+           (id, user_id, name, sort_order, collapsed, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 0, ?, ?)""",
+        (gid, user_id, name.strip() or "未命名分组", sort_order, now, now),
+    )
+    conn.commit()
+    group = conn.execute("SELECT * FROM root_groups WHERE id=? AND user_id=?", (gid, user_id)).fetchone()
+    conn.close()
+    return dict(group)
+
+
+def update_root_group(group_id: str, user_id: str = LOCAL_USER_ID, **data) -> Optional[dict]:
+    allowed = {"name", "sort_order", "collapsed"}
+    updates = {k: v for k, v in data.items() if k in allowed}
+    if not updates:
+        return get_root_group(group_id, user_id=user_id)
+    if "name" in updates:
+        updates["name"] = str(updates["name"]).strip() or "未命名分组"
+    if "collapsed" in updates:
+        updates["collapsed"] = 1 if updates["collapsed"] else 0
+
+    conn = get_db()
+    sets = ", ".join([f"{k}=?" for k in updates.keys()])
+    vals = list(updates.values()) + [_now(), group_id, user_id]
+    conn.execute(
+        f"UPDATE root_groups SET {sets}, updated_at=? WHERE id=? AND user_id=?",
+        vals,
+    )
+    conn.commit()
+    row = conn.execute("SELECT * FROM root_groups WHERE id=? AND user_id=?", (group_id, user_id)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_root_group(group_id: str, user_id: str = LOCAL_USER_ID) -> Optional[dict]:
+    conn = get_db()
+    row = conn.execute("SELECT * FROM root_groups WHERE id=? AND user_id=?", (group_id, user_id)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def delete_root_group(group_id: str, user_id: str = LOCAL_USER_ID) -> bool:
+    conn = get_db()
+    exists = conn.execute("SELECT id FROM root_groups WHERE id=? AND user_id=?", (group_id, user_id)).fetchone()
+    if not exists:
+        conn.close()
+        return False
+    conn.execute(
+        "UPDATE nodes SET group_id=NULL, group_order=NULL WHERE user_id=? AND parent_id IS NULL AND group_id=?",
+        (user_id, group_id),
+    )
+    conn.execute("DELETE FROM root_groups WHERE id=? AND user_id=?", (group_id, user_id))
+    conn.commit()
+    conn.close()
+    return True
+
+
+def move_root_to_group(
+    root_id: str,
+    group_id: str | None,
+    user_id: str = LOCAL_USER_ID,
+) -> Optional[dict]:
+    """Move a root between sidebar groups without touching the conversation updated_at."""
+    conn = get_db()
+    root = conn.execute(
+        "SELECT id, group_id FROM nodes WHERE id=? AND user_id=? AND parent_id IS NULL",
+        (root_id, user_id),
+    ).fetchone()
+    if not root:
+        conn.close()
+        return None
+    if group_id:
+        group = conn.execute("SELECT id FROM root_groups WHERE id=? AND user_id=?", (group_id, user_id)).fetchone()
+        if not group:
+            conn.close()
+            return None
+
+    conn.execute(
+        "UPDATE nodes SET group_id=?, group_order=NULL WHERE id=? AND user_id=? AND parent_id IS NULL",
+        (group_id, root_id, user_id),
+    )
+
+    conn.commit()
+    moved = conn.execute("SELECT * FROM nodes WHERE id=? AND user_id=?", (root_id, user_id)).fetchone()
+    conn.close()
+    return dict(moved) if moved else None
 
 
 def get_root(root_id: str, user_id: str = LOCAL_USER_ID) -> Optional[dict]:
@@ -1196,6 +1475,27 @@ def get_node_children(nid: str, parent_model_id: str=None, user_id: str = LOCAL_
         rows = conn.execute(
             "SELECT * FROM nodes WHERE parent_id=? AND user_id=? AND parent_model_id=? ORDER BY child_order", (nid, user_id, parent_model_id)
         ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_nodes_created_between(
+    user_id: str,
+    start_at: str,
+    end_at: str,
+    limit: int = 200,
+) -> list[dict]:
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT id, root_id, parent_id, content, summary, created_at
+           FROM nodes
+           WHERE user_id=?
+             AND created_at>=?
+             AND created_at<?
+           ORDER BY created_at
+           LIMIT ?""",
+        (user_id, start_at, end_at, max(1, min(int(limit or 200), 1000))),
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -1641,13 +1941,14 @@ def save_model_config(cfg: dict, user_id: str = LOCAL_USER_ID) -> dict:
         # UPDATE — 仅覆盖传入字段，usage / input_tokens / output_tokens / deleted 不受影响
         conn.execute(
             """UPDATE model_configs SET
-               name=?, provider=?, base_url=?, api_key=?, model_name=?,
+               name=?, provider=?, base_url=?, proxy_url=?, api_key=?, model_name=?,
                max_tokens=?, price_per_input=?, price_per_output=?, price_unit=?,
                thinking_budget=?, meta=?, created_at=?
                WHERE id=? AND user_id=?""",
             (cfg.get("name", existing["name"]),
              cfg.get("provider", existing["provider"]),
              cfg.get("base_url", existing["base_url"]),
+             cfg.get("proxy_url", existing["proxy_url"] if "proxy_url" in existing.keys() else ""),
              encrypt_secret(cfg.get("api_key")) if "api_key" in cfg else existing["api_key"],
              cfg.get("model_name", existing["model_name"]),
              cfg.get("max_tokens", existing["max_tokens"]),
@@ -1663,13 +1964,14 @@ def save_model_config(cfg: dict, user_id: str = LOCAL_USER_ID) -> dict:
         # INSERT — 新记录
         conn.execute(
             """INSERT INTO model_configs
-               (id, user_id, name, provider, base_url, api_key, model_name,
+               (id, user_id, name, provider, base_url, proxy_url, api_key, model_name,
                 max_tokens, price_per_input, price_per_output, price_unit,
                 thinking_budget, usage, deleted, meta, created_at,
                 input_tokens, output_tokens)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 0, 0)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, ?, 0, 0)""",
             (cfg_id, user_id, cfg["name"], cfg["provider"],
-             cfg.get("base_url", ""), encrypt_secret(cfg.get("api_key", "")),
+             cfg.get("base_url", ""), cfg.get("proxy_url", ""),
+             encrypt_secret(cfg.get("api_key", "")),
              cfg["model_name"], cfg.get("max_tokens", 4096),
              cfg.get("price_per_input", 0), cfg.get("price_per_output", 0),
              cfg.get("price_unit", "CNY"),
@@ -1974,6 +2276,7 @@ def list_shared_model_configs_for_user(user_id: str = LOCAL_USER_ID) -> list[dic
             "name": f"{row['capability_name']} · {row['family_name']}",
             "provider": row["provider"],
             "base_url": row["base_url"],
+            "proxy_url": row.get("proxy_url", ""),
             "api_key": "",
             "model_name": row["model_name"],
             "max_tokens": row["max_tokens"],
@@ -2239,68 +2542,140 @@ def get_all_settings(user_id: str = LOCAL_USER_ID) -> dict:
     }
 
 
+def increment_setting_ints(increments: dict[str, int], user_id: str = LOCAL_USER_ID) -> dict[str, int]:
+    """Atomically increment integer settings and return their new values."""
+    conn = get_db()
+    next_values: dict[str, int] = {}
+    for key, delta in increments.items():
+        row = conn.execute(
+            "SELECT value FROM settings WHERE user_id=? AND key=?",
+            (user_id, key),
+        ).fetchone()
+        try:
+            current = int(row["value"]) if row and row["value"] is not None else 0
+        except (TypeError, ValueError):
+            current = 0
+        next_value = current + int(delta)
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (user_id, key, value) VALUES (?, ?, ?)",
+            (user_id, key, str(next_value)),
+        )
+        next_values[key] = next_value
+    conn.commit()
+    conn.close()
+    return next_values
+
+
 # ═══════════════════════════════════════════════
 # 搜索
 # ═══════════════════════════════════════════════
 
-def search_nodes(query: str, user_id: str = LOCAL_USER_ID) -> list[dict]:
+DEFAULT_SEARCH_GROUP_ID = "__default__"
+
+
+def _search_group_filter_sql(group_ids: list[str] | None, root_alias: str = "root") -> tuple[str, list[str]]:
+    """Build an optional SQL filter for root sidebar groups."""
+    if not group_ids:
+        return "", []
+
+    include_default = DEFAULT_SEARCH_GROUP_ID in group_ids
+    custom_group_ids = [gid for gid in group_ids if gid and gid != DEFAULT_SEARCH_GROUP_ID]
+    clauses = []
+    params: list[str] = []
+    if custom_group_ids:
+        placeholders = ",".join("?" for _ in custom_group_ids)
+        clauses.append(f"{root_alias}.group_id IN ({placeholders})")
+        params.extend(custom_group_ids)
+    if include_default:
+        clauses.append(f"{root_alias}.group_id IS NULL")
+    if not clauses:
+        return "", []
+    return f" AND ({' OR '.join(clauses)})", params
+
+
+def search_nodes(query: str, user_id: str = LOCAL_USER_ID, group_ids: list[str] | None = None) -> list[dict]:
     """FTS5 搜索节点内容，CJK 用 LIKE fallback"""
     conn = get_db()
     has_cjk = bool(re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', query))
+    group_filter, group_params = _search_group_filter_sql(group_ids)
     if has_cjk:
         rows = conn.execute(
-            "SELECT * FROM nodes WHERE user_id=? AND content LIKE ? ORDER BY created_at DESC LIMIT 50",
-            (user_id, f"%{query}%"),
+            f"""SELECT n.* FROM nodes n
+                JOIN nodes root ON root.id = COALESCE(n.root_id, n.id)
+                                AND root.user_id = n.user_id
+                WHERE n.user_id=? AND n.content LIKE ?{group_filter}
+                ORDER BY n.created_at DESC LIMIT 50""",
+            [user_id, f"%{query}%"] + group_params,
         ).fetchall()
     else:
         try:
             rows = conn.execute(
                 """SELECT n.* FROM nodes n
                    JOIN nodes_fts fts ON n.rowid = fts.rowid
-                   WHERE n.user_id=? AND nodes_fts MATCH ?
+                   JOIN nodes root ON root.id = COALESCE(n.root_id, n.id)
+                                   AND root.user_id = n.user_id
+                   WHERE n.user_id=? AND nodes_fts MATCH ?""" + group_filter + """
                    ORDER BY rank LIMIT 50""",
-                (user_id, query),
+                [user_id, query] + group_params,
             ).fetchall()
         except Exception:
             rows = conn.execute(
-                "SELECT * FROM nodes WHERE user_id=? AND content LIKE ? ORDER BY created_at DESC LIMIT 50",
-                (user_id, f"%{query}%"),
+                f"""SELECT n.* FROM nodes n
+                    JOIN nodes root ON root.id = COALESCE(n.root_id, n.id)
+                                    AND root.user_id = n.user_id
+                    WHERE n.user_id=? AND n.content LIKE ?{group_filter}
+                    ORDER BY n.created_at DESC LIMIT 50""",
+                [user_id, f"%{query}%"] + group_params,
             ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def search_responses(query: str, user_id: str = LOCAL_USER_ID) -> list[dict]:
+def search_responses(query: str, user_id: str = LOCAL_USER_ID, group_ids: list[str] | None = None) -> list[dict]:
     """FTS5 搜索回答内容"""
     conn = get_db()
     has_cjk = bool(re.search(r'[\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]', query))
+    group_filter, group_params = _search_group_filter_sql(group_ids)
     if has_cjk:
         rows = conn.execute(
-            "SELECT * FROM responses WHERE user_id=? AND content LIKE ? ORDER BY created_at DESC LIMIT 50",
-            (user_id, f"%{query}%"),
+            f"""SELECT r.* FROM responses r
+                JOIN nodes n ON n.id = r.node_id AND n.user_id = r.user_id
+                JOIN nodes root ON root.id = COALESCE(n.root_id, n.id)
+                                AND root.user_id = n.user_id
+                WHERE r.user_id=? AND r.content LIKE ?{group_filter}
+                ORDER BY r.created_at DESC LIMIT 50""",
+            [user_id, f"%{query}%"] + group_params,
         ).fetchall()
     else:
         try:
             rows = conn.execute(
                 """SELECT r.* FROM responses r
                    JOIN responses_fts fts ON r.rowid = fts.rowid
-                   WHERE r.user_id=? AND responses_fts MATCH ?
+                   JOIN nodes n ON n.id = r.node_id AND n.user_id = r.user_id
+                   JOIN nodes root ON root.id = COALESCE(n.root_id, n.id)
+                                   AND root.user_id = n.user_id
+                   WHERE r.user_id=? AND responses_fts MATCH ?""" + group_filter + """
                    ORDER BY rank LIMIT 50""",
-                (user_id, query),
+                [user_id, query] + group_params,
             ).fetchall()
         except Exception:
             rows = conn.execute(
-                "SELECT * FROM responses WHERE user_id=? AND content LIKE ? ORDER BY created_at DESC LIMIT 50",
-                (user_id, f"%{query}%"),
+                f"""SELECT r.* FROM responses r
+                    JOIN nodes n ON n.id = r.node_id AND n.user_id = r.user_id
+                    JOIN nodes root ON root.id = COALESCE(n.root_id, n.id)
+                                    AND root.user_id = n.user_id
+                    WHERE r.user_id=? AND r.content LIKE ?{group_filter}
+                    ORDER BY r.created_at DESC LIMIT 50""",
+                [user_id, f"%{query}%"] + group_params,
             ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def search_all(query: str, user_id: str = LOCAL_USER_ID) -> list[dict]:
+def search_all(query: str, user_id: str = LOCAL_USER_ID, group_ids: list[str] | None = None) -> list[dict]:
     """同时搜索 nodes 和 responses，返回合并结果带 root 信息。"""
-    nodes = search_nodes(query, user_id=user_id)
-    responses = search_responses(query, user_id=user_id)
+    nodes = search_nodes(query, user_id=user_id, group_ids=group_ids)
+    responses = search_responses(query, user_id=user_id, group_ids=group_ids)
     conn = get_db()
     results = []
     for n in nodes:

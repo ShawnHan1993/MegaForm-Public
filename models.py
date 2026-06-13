@@ -138,6 +138,33 @@ def _is_deepseek_v4_model(model_name: str) -> bool:
     return name.startswith("deepseek-v4")
 
 
+def _message_content_length(content) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for item in content:
+            if isinstance(item, dict):
+                total += len(str(item.get("text") or ""))
+                image_url = item.get("image_url")
+                if isinstance(image_url, dict):
+                    total += min(len(str(image_url.get("url") or "")), 2048)
+                elif image_url:
+                    total += min(len(str(image_url)), 2048)
+        return total
+    return len(str(content or ""))
+
+
+def _parse_data_url(data_url: str) -> tuple[str, str] | None:
+    if not isinstance(data_url, str) or not data_url.startswith("data:"):
+        return None
+    header, sep, data = data_url.partition(",")
+    if not sep or ";base64" not in header:
+        return None
+    media_type = header[5:].split(";")[0] or "image/jpeg"
+    return media_type, data
+
+
 def _proxy_env_state() -> str:
     return " ".join(
         f"{key}={'set' if os.environ.get(key) else 'unset'}"
@@ -148,25 +175,45 @@ def _proxy_env_state() -> str:
     )
 
 
+def _normalize_proxy_url(proxy_url: str | None) -> str:
+    proxy = (proxy_url or "").strip()
+    if proxy and "://" not in proxy:
+        return f"http://{proxy}"
+    return proxy
+
+
+def _proxy_log_state(proxy_url: str | None) -> str:
+    return "set" if _normalize_proxy_url(proxy_url) else "unset"
+
+
+def _httpx_client_kwargs(timeout, proxy_url: str | None = None) -> dict:
+    kwargs = {"timeout": timeout}
+    proxy = _normalize_proxy_url(proxy_url)
+    if proxy:
+        kwargs["proxy"] = proxy
+        kwargs["trust_env"] = False
+    return kwargs
+
+
 def _log_openai_stream_transient_error(
     exc: Exception, *, url: str, provider: str, model_name: str,
-    attempt: int, max_retries: int, will_retry: bool,
+    attempt: int, max_retries: int, will_retry: bool, proxy_url: str | None = None,
 ) -> None:
     log.warning(
         "stream-openai: transient network error endpoint=%s provider=%s model=%s "
-        "attempt=%d/%d retry=%s proxy_env=%s error=%s: %s",
+        "attempt=%d/%d retry=%s proxy=%s proxy_env=%s error=%s: %s",
         url, provider, model_name, attempt + 1, max_retries + 1, will_retry,
-        _proxy_env_state(), type(exc).__name__, exc,
+        _proxy_log_state(proxy_url), _proxy_env_state(), type(exc).__name__, exc,
     )
 
 
-def _format_openai_stream_connect_error(exc: Exception, *, provider: str, url: str) -> str:
+def _format_openai_stream_connect_error(exc: Exception, *, provider: str, url: str, proxy_url: str | None = None) -> str:
     message = str(exc)
     if provider == "deepseek" and "TLS/SSL connection has been closed" in message:
         return (
             "DeepSeek 连接在 TLS 握手阶段被关闭。请求尚未进入模型推理，通常是网络线路、"
             "代理/VPN、DNS 或 DeepSeek API 入口临时异常；请检查代理环境或稍后重试。"
-            f"endpoint={url} proxy_env={_proxy_env_state()} original={message}"
+            f"endpoint={url} proxy={_proxy_log_state(proxy_url)} proxy_env={_proxy_env_state()} original={message}"
         )
     return message
 
@@ -268,6 +315,7 @@ MODEL_CONFIG_SCHEMA = {
          "options": ["openai", "deepseek", "ollama", "anthropic", "custom"],
          "required": True},
         {"key": "base_url", "label": "API 地址", "type": "text", "placeholder": "https://api.deepseek.com/v1"},
+        {"key": "proxy_url", "label": "代理地址", "type": "text", "placeholder": "http://127.0.0.1:7890"},
         {"key": "api_key", "label": "API Key", "type": "password", "placeholder": "sk-..."},
         {"key": "model_name", "label": "模型名", "type": "text", "placeholder": "deepseek-chat", "required": True},
         {"key": "max_tokens", "label": "最大输出 Token", "type": "number", "default": 4096},
@@ -310,11 +358,12 @@ async def chat_completion_stream(
     api_key = model_cfg.get("api_key", "")
     model_name = model_cfg.get("model_name", "")
     max_tokens = model_cfg.get("max_tokens", 4096)
+    proxy_url = model_cfg.get("proxy_url", "")
 
     if provider == "anthropic" or _is_openrouter_anthropic_model(provider, base_url, model_name):
         async for event in _stream_anthropic(
             base_url, api_key, model_name, messages, max_tokens, thinking_budget,
-            search_config=search_config):
+            search_config=search_config, proxy_url=proxy_url):
             yield event
     elif _is_google_gemini_base_url(base_url) and "gemini" in model_name.lower():
         # 只有直连 Google Gemini 时才走原生 API；OpenRouter 等代理仍走 OpenAI-compatible。
@@ -323,13 +372,13 @@ async def chat_completion_stream(
             yield {"type": "thinking", "content": content}
         async for event in _stream_gemini_native(
             api_key, model_name, messages, max_tokens,
-            thinking_budget=thinking_budget, search_config=search_config,
+            thinking_budget=thinking_budget, search_config=search_config, proxy_url=proxy_url,
         ):
             yield event
     else:
         async for event in _stream_openai_compatible(
             base_url, api_key, model_name, messages, max_tokens, provider, thinking_budget,
-            search_config=search_config, language=language,
+            search_config=search_config, language=language, proxy_url=proxy_url,
         ):
             yield event
 
@@ -415,6 +464,7 @@ async def _stream_openai_compatible(
     thinking_budget: int = 0,
     search_config: Optional[dict] = None,
     language: str = "zh-CN",
+    proxy_url: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """OpenAI 兼容 API 流式调用（含联网搜索）。
 
@@ -449,7 +499,7 @@ async def _stream_openai_compatible(
             payload[native_search["key"]] = native_search["value"]
 
     url = f"{base_url}/chat/completions"
-    log.info("stream-openai: %s/%s url=%s, max_tokens=%d thinking=%d", provider, model_name, url, max_tokens, thinking_budget)
+    log.info("stream-openai: %s/%s url=%s, max_tokens=%d thinking=%d proxy=%s", provider, model_name, url, max_tokens, thinking_budget, _proxy_log_state(proxy_url))
     if search_config and not native_search:
         chatting_turns = MAX_TOOL_ROUNDS
         payload["tools"] = _web_search_tools(language)
@@ -476,7 +526,7 @@ async def _stream_openai_compatible(
         for attempt in range(OPENAI_STREAM_MAX_RETRIES + 1):
             current_msg = {}
             try:
-                async with httpx.AsyncClient(timeout=OPENAI_STREAM_TIMEOUT) as client:
+                async with httpx.AsyncClient(**_httpx_client_kwargs(OPENAI_STREAM_TIMEOUT, proxy_url)) as client:
                     async with client.stream("POST", url, headers=headers, json=payload) as resp:
                         if chatting_turn == chatting_turns - 1:
                             payload.pop("tools", None)  # 最后一个轮次不再提供工具，避免模型重复调用:
@@ -585,11 +635,11 @@ async def _stream_openai_compatible(
                 _log_openai_stream_transient_error(
                     e, url=url, provider=provider, model_name=model_name,
                     attempt=attempt, max_retries=OPENAI_STREAM_MAX_RETRIES,
-                    will_retry=will_retry,
+                    will_retry=will_retry, proxy_url=proxy_url,
                 )
                 if not will_retry:
                     raise RuntimeError(
-                        _format_openai_stream_connect_error(e, provider=provider, url=url)
+                        _format_openai_stream_connect_error(e, provider=provider, url=url, proxy_url=proxy_url)
                     ) from e
                 await asyncio.sleep(OPENAI_STREAM_RETRY_BASE_DELAY * (2 ** attempt))
 
@@ -628,6 +678,13 @@ def _convert_messages_to_gemini_contents(messages: list[dict]) -> list[dict]:
             for item in content:
                 if item.get("type") == "text":
                     parts.append({"text": item["text"]})
+                elif item.get("type") == "image_url":
+                    image_url = item.get("image_url")
+                    url = image_url.get("url") if isinstance(image_url, dict) else image_url
+                    parsed = _parse_data_url(url or "")
+                    if parsed:
+                        media_type, data = parsed
+                        parts.append({"inline_data": {"mime_type": media_type, "data": data}})
         else:
             parts.append({"text": str(content)})
         if parts:
@@ -642,6 +699,7 @@ async def _stream_gemini_native(
     max_tokens: int,
     thinking_budget: int = 0,
     search_config: Optional[dict] = None,
+    proxy_url: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """Gemini 原生 streamGenerateContent API 流式调用。
 
@@ -713,10 +771,10 @@ async def _stream_gemini_native(
     if search_config:
         body["tools"] = [{"google_search": {}}]
 
-    log.info("stream-gemini-native: model=%s max_tokens=%d thinking=%d search=%s",
-             model_id, max_tokens, thinking_budget, bool(search_config))
+    log.info("stream-gemini-native: model=%s max_tokens=%d thinking=%d search=%s proxy=%s",
+             model_id, max_tokens, thinking_budget, bool(search_config), _proxy_log_state(proxy_url))
 
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(**_httpx_client_kwargs(300, proxy_url)) as client:
         async with client.stream("POST", url, headers=headers, params=params, json=body) as resp:
             resp.raise_for_status()
 
@@ -780,7 +838,7 @@ async def _stream_gemini_native(
                 yield {"type": "usage", "usage": usage_info}
             else:
                 # 估算（fallback）
-                total_input_chars = sum(len(m.get("content", "")) for m in messages)
+                total_input_chars = sum(_message_content_length(m.get("content", "")) for m in messages)
                 total_output_chars = len(full_text) + len(full_thinking)
                 yield {
                     "type": "usage",
@@ -796,11 +854,42 @@ def _build_anthropic_payload(model_name: str, messages: list[dict], max_tokens: 
     """
     system_msg = ""
     user_msgs = []
+    def convert_content(content):
+        if not isinstance(content, list):
+            return content
+        converted = []
+        for item in content:
+            if item.get("type") == "text":
+                converted.append({"type": "text", "text": item.get("text", "")})
+            elif item.get("type") == "image_url":
+                image_url = item.get("image_url")
+                url = image_url.get("url") if isinstance(image_url, dict) else image_url
+                parsed = _parse_data_url(url or "")
+                if parsed:
+                    media_type, data = parsed
+                    converted.append({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": data,
+                        },
+                    })
+                elif url:
+                    converted.append({
+                        "type": "image",
+                        "source": {
+                            "type": "url",
+                            "url": url,
+                        },
+                    })
+        return converted
+
     for m in messages:
         if m["role"] == "system":
             system_msg = m["content"]
         else:
-            user_msgs.append(m)
+            user_msgs.append({**m, "content": convert_content(m.get("content", ""))})
 
     payload = {
         "model": model_name,
@@ -829,6 +918,7 @@ async def _stream_anthropic(
     messages: list[dict], max_tokens: int,
     thinking_budget: int = 0,
     search_config: Optional[dict] = None,
+    proxy_url: str | None = None,
 ) -> AsyncGenerator[dict, None]:
     """Anthropic Messages API 流式调用。
 
@@ -862,12 +952,12 @@ async def _stream_anthropic(
         payload["tools"] = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}]
 
     url = _anthropic_messages_url(base_url)
-    log.info("stream-anthropic: %s url=%s max_tokens=%d thinking=%d search=%s", model_name, url, max_tokens, thinking_budget, str(bool(search_config)))
+    log.info("stream-anthropic: %s url=%s max_tokens=%d thinking=%d search=%s proxy=%s", model_name, url, max_tokens, thinking_budget, str(bool(search_config)), _proxy_log_state(proxy_url))
 
     # Anthropic SSE 格式：先 event: 行指示事件类型，再 data: 行携带 JSON
     event_type = ""
     usage_info = {}
-    async with httpx.AsyncClient(timeout=300) as client:
+    async with httpx.AsyncClient(**_httpx_client_kwargs(300, proxy_url)) as client:
         async with client.stream("POST", url, headers=headers, json=payload) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():

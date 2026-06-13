@@ -4,13 +4,14 @@ import { api } from '../api/client';
 import type { Node } from '../types';
 import ResponseArea from './ResponseArea';
 import MarkdownContent from './MarkdownContent';
-import { BookOpenText, ChevronDown, Ellipsis, Pencil, RefreshCcw, Trash, CircleAlert, FileText } from 'lucide-react';
+import { BookOpenText, ChevronDown, Crosshair, Ellipsis, Pencil, RefreshCcw, Trash, CircleAlert, FileText, Sparkles } from 'lucide-react';
 import { useT } from '../i18n';
 
 /** NodeCard 组件 Props */
 interface Props {
   node: Node;                        // 当前节点数据
   depth: number;                     // 当前深度（用于缩进等样式）
+  suppressEnterAnimation?: boolean;  // 相机下钻提交帧：避免新卡片再次入场弹动
 }
 
 /**
@@ -20,26 +21,29 @@ interface Props {
  * 1. 渲染问题区（折叠箭头 + 问题文本 + 编辑 + 重跑）
  * 2. 折叠状态：每个节点只有 collapsed 一个布尔状态，折叠只影响自身，不影响子节点。
  * 3. 仅点击折叠箭头折叠/展开，双击问题区聚焦该节点
- * 4. ⋯ 菜单：编辑并重跑 / 重跑不修改 / 删除节点
+ * 4. ⋯ 菜单：聚焦 / 沉浸式浏览 / 编辑并重跑 / 重跑不修改 / 删除节点
  * 5. 编辑模式（textarea 编辑问题内容）
  * 6. 渲染 ResponseArea 回答区 + progression 子节点
- * 7. 沉浸式浏览按钮（隐藏追问分支）
+ * 7. 沉浸式浏览（隐藏追问分支）
  */
-export default function NodeCard({ node, depth }: Props) {
+export default function NodeCard({ node, depth, suppressEnterAnimation = false }: Props) {
   const t = useT();
   // ────── 全局状态 ──────
   const collapsedSet = useAppStore(s => s.collapsedSet);           // 折叠节点 ID 集合
   const immersiveHiddenSet = useAppStore(s => s.immersiveHiddenSet); // 沉浸式隐藏节点 ID 集合
-  const focusNode = useAppStore(s => s.focusNode);                 // 聚焦某节点
   const toggleCollapse = useAppStore(s => s.toggleCollapse);       // 折叠/展开切换
   const setDescendantsCollapse = useAppStore(s => s.setDescendantsCollapse); // 递归折叠/展开
   const toggleImmersive = useAppStore(s => s.toggleImmersive);     // 沉浸式浏览切换
+  const focusNode = useAppStore(s => s.focusNode);                 // 全局聚焦节点
   const models = useAppStore(s => s.models);                       // 模型列表
   const deleteNode = useAppStore(s => s.deleteNode);               // 删除节点
   const rerunNode = useAppStore(s => s.rerunNode);                 // 重跑节点
+  const summaryModelId = useAppStore(s => s.summaryModelId);       // 自动摘要模型
+  const generateNodeSummary = useAppStore(s => s.generateNodeSummary); // 手动触发自动摘要
   const sendingMessage = useAppStore(s => s.sendingMessage);       // 是否正在发送消息
   const streamingNodeIds = useAppStore(s => s.streamingNodeIds);     // 所有流式输出的节点 ID 集合
   const streamingResponses = useAppStore(s => s.streamingResponses); // 流式响应数据 (复合键 nodeId:modelId)
+  const searchScrollTarget = useAppStore(s => s.searchScrollTarget); // 搜索结果命中定位
 
   // ────── 折叠状态 ──────
   // selfCollapsed：此节点在 collapsedSet 中，用户主动折叠
@@ -86,6 +90,7 @@ export default function NodeCard({ node, depth }: Props) {
   // ────── 摘要编辑状态 ──────
   const [summaryEditing, setSummaryEditing] = useState(false);
   const [summaryText, setSummaryText] = useState('');
+  const [summaryGenerating, setSummaryGenerating] = useState(false);
   const summaryRef = useRef<HTMLTextAreaElement>(null);
 
   // 开始编辑摘要
@@ -123,6 +128,20 @@ export default function NodeCard({ node, depth }: Props) {
     setSummaryEditing(false);
   }, [node.id, summaryText]);
 
+  const handleAutoSummary = useCallback(async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!summaryModelId || summaryGenerating) return;
+    setSummaryGenerating(true);
+    setMenuOpen(false);
+    try {
+      await generateNodeSummary(node.id, { force: true });
+    } catch (err) {
+      console.error('自动摘要失败:', err);
+    } finally {
+      setSummaryGenerating(false);
+    }
+  }, [generateNodeSummary, node.id, summaryGenerating, summaryModelId]);
+
   // 摘要 textarea 键盘处理
   const handleSummaryKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -154,14 +173,24 @@ export default function NodeCard({ node, depth }: Props) {
   );
 
   // ────── 入场动画（首次渲染 500ms 后移除 entering class） ──────
-  const [entering, setEntering] = useState(true);
+  const [entering, setEntering] = useState(!suppressEnterAnimation);
   useEffect(() => {
+    if (suppressEnterAnimation) {
+      setEntering(false);
+      return;
+    }
     const timer = setTimeout(() => setEntering(false), 500);
     return () => clearTimeout(timer);
-  }, []);
+  }, [suppressEnterAnimation]);
 
   // 所有回复数据
   const responses = node.responses || [];
+  const questionSearchHit = searchScrollTarget?.type === 'node' && searchScrollTarget.nodeId === node.id
+    ? {
+        query: searchScrollTarget.query.trim(),
+        hitId: `search-${searchScrollTarget.requestId}`,
+      }
+    : null;
   const activeModelIds = useMemo(
     () => new Set(models.filter(m => m.deleted !== 1).map(m => m.id)),
     [models],
@@ -380,21 +409,62 @@ export default function NodeCard({ node, depth }: Props) {
     rerunNode(node.id, undefined, rerunModelIds);
   };
 
-  // ────── 双击问题区聚焦当前节点 ──────
-  /** handleDoubleClick — 双击：聚焦当前节点（退出其他沉浸/聚焦态），同步 URL */
-  const handleDoubleClick = () => {
+  /** handleFocusNode — 切换全局聚焦到当前节点 */
+  const handleFocusNode = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setMenuOpen(false);
     focusNode(node.id);
-    window.history.pushState(null, '', '/node/' + node.id);
+  };
+
+  /** handleToggleImmersive — 隐藏/恢复当前节点的追问分支 */
+  const handleToggleImmersive = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setMenuOpen(false);
+    toggleImmersive(node.id);
+  };
+
+  // ────── 下钻当前节点 ──────
+  /** requestDrillIntoNode — 发起 Workflowy 式相机下钻；折叠卡片先展开再移动视角。 */
+  const requestDrillIntoNode = () => {
+    const dispatchDrill = () => {
+      window.dispatchEvent(new CustomEvent('megaform:drill-node', {
+        detail: { nodeId: node.id },
+      }));
+    };
+
+    if (selfCollapsed && canCollapse) {
+      toggleCollapse(node.id);
+      window.setTimeout(dispatchDrill, 220);
+      return;
+    }
+
+    dispatchDrill();
   };
 
   const descCount = countDescendants(node);                // 后代总数
   const showResponses = !hideResponses || isStreaming;      // 流式中即使折叠也显示
 
+  const renderQuestionText = (text: string) => {
+    if (!questionSearchHit?.query) return text;
+    const idx = text.toLocaleLowerCase().indexOf(questionSearchHit.query.toLocaleLowerCase());
+    if (idx < 0) return text;
+    return (
+      <>
+        {text.slice(0, idx)}
+        <span className="search-hit-anchor" data-search-hit={questionSearchHit.hitId}>
+          {text.slice(idx, idx + questionSearchHit.query.length)}
+        </span>
+        {text.slice(idx + questionSearchHit.query.length)}
+      </>
+    );
+  };
+
   return (
-    <div className={`node-card${node.relation === 'followup' ? ' node-followup' : ''}${selfCollapsed ? ' is-collapsed' : ''}${isLogicalNode ? ' node-logical' : ''}${entering ? (node.relation === 'followup' ? ' node-entering-followup' : ' node-entering-progression') : ''}`} data-scroll-anchor={node.id}>
+    <div className={`node-card${node.relation === 'followup' ? ' node-followup' : ''}${selfCollapsed ? ' is-collapsed' : ''}${isLogicalNode ? ' node-logical' : ''}${entering ? (node.relation === 'followup' ? ' node-entering-followup' : ' node-entering-progression') : ''}`} data-scroll-anchor={node.id} data-node-card-id={node.id}>
       {/* ────── 问题区（始终可见） ────── */}
       <div
         className="question-block"
+        data-question-anchor={node.id}
       >
         {/* 折叠箭头：有内容时始终显示交互按钮，旋转状态反映当前是否折叠 */}
         {canCollapse && (
@@ -461,9 +531,9 @@ export default function NodeCard({ node, depth }: Props) {
           </div>
         ) : (
           /* 展示态：折叠时有摘要则显示摘要，否则显示问题 */
-          <div className="question-display" onDoubleClick={handleDoubleClick} title={t('focusNodeHint')}>
+          <div className="question-display" onDoubleClick={requestDrillIntoNode} title={t('focusNodeHint')}>
             <div className="question-text">
-              {selfCollapsed && node.summary ? node.summary : node.content}
+              {renderQuestionText(selfCollapsed && node.summary ? node.summary : node.content)}
             </div>
 
             {/* ── 折叠信息指示（自身折叠时显示） ── */}
@@ -494,19 +564,6 @@ export default function NodeCard({ node, depth }: Props) {
             {/* 操作按钮：展开态贴在正文最后一行右侧；折叠态保持紧凑行内显示 */}
             {!isStreaming && (
               <span className="question-actions">
-                {/* 沉浸式浏览按钮：有追问子节点 && 回复可见时显示 */}
-                {hasFollowupChildren && !hideResponses && (
-                  <button
-                    className={`immersive-btn ${isImmersive ? 'selected' : ''}`}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      toggleImmersive(node.id);
-                    }}
-                    title={t('immersiveBrowse')}
-                  >
-                    <BookOpenText size={18} />
-                  </button>
-                )}
                 <span className="node-menu-container" ref={menuRef}>
                   <button
                     className="node-menu-btn"
@@ -521,9 +578,32 @@ export default function NodeCard({ node, depth }: Props) {
                   </button>
                   {menuOpen && (
                     <div className="node-menu">
+                      {/* 聚焦当前节点 */}
+                      <button className="menu-item" onClick={handleFocusNode}>
+                        <Crosshair size={14} /> {t('focusNode')}
+                      </button>
+                      {/* 沉浸式浏览：有追问子节点时显示 */}
+                      {hasFollowupChildren && !hideResponses && (
+                        <button
+                          className={`menu-item ${isImmersive ? 'menu-item-active' : ''}`}
+                          onClick={handleToggleImmersive}
+                          title={t('immersiveBrowse')}
+                        >
+                          <BookOpenText size={14} /> {isImmersive ? t('exitImmersiveBrowse') : t('immersiveBrowseShort')}
+                        </button>
+                      )}
+                      <div className="menu-divider" />
                       {/* 编辑摘要 */}
                       <button className="menu-item" onClick={startSummaryEdit}>
                         <FileText size={14} /> {node.summary ? t('editSummary') : t('addSummary')}
+                      </button>
+                      <button
+                        className="menu-item"
+                        onClick={handleAutoSummary}
+                        disabled={!summaryModelId || summaryGenerating}
+                        title={!summaryModelId ? t('autoSummaryModelRequired') : t('autoSummary')}
+                      >
+                        <Sparkles size={14} /> {summaryGenerating ? t('autoSummaryGenerating') : t('autoSummary')}
                       </button>
                       {isLogicalNode ? (
                         <button
@@ -590,6 +670,7 @@ export default function NodeCard({ node, depth }: Props) {
                       immersive={isImmersive}
                       streamingResponses={hasStreamingResponses ? nodeStreamingResponses : undefined}
                       isStreamingNode={isStreaming}
+                      suppressModelChipAnimation={suppressEnterAnimation}
                     />
                   </div>
                 )}
@@ -616,6 +697,7 @@ export default function NodeCard({ node, depth }: Props) {
                   key={child.id}
                   node={child}
                   depth={depth}
+                  suppressEnterAnimation={suppressEnterAnimation}
                 />
               ))}
             </div>
@@ -627,7 +709,12 @@ export default function NodeCard({ node, depth }: Props) {
       {selfCollapsed && collapsedChildren.length > 0 && (
         <div className="collapsed-children">
           {collapsedChildren.map(child => (
-            <NodeCard key={child.id} node={child} depth={depth + 1} />
+            <NodeCard
+              key={child.id}
+              node={child}
+              depth={depth + 1}
+              suppressEnterAnimation={suppressEnterAnimation}
+            />
           ))}
         </div>
       )}

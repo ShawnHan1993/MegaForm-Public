@@ -14,8 +14,9 @@ import { useAppStore } from '../store/appStore';
 import type { CurrentUser, ModelConfig, TokenUsage, UserProfileVersion } from '../types';
 import { api } from '../api/client';
 import { PROVIDER_PRESETS, getCurrencySymbol, type ProviderPreset, type ModelPreset } from '../data/providerPresets';
-import { X, Search, AlertTriangle, Activity, CheckCircle2, RefreshCcw, Loader, User, LogOut, FileText, History } from 'lucide-react';
+import { X, Search, AlertTriangle, Activity, CheckCircle2, RefreshCcw, Loader, User, LogOut, FileText, History, Bot, Image as ImageIcon } from 'lucide-react';
 import { LANGUAGES, getLanguage, localizePresetText, localizeSearchProviderText, useLanguage, useT, type Language } from '../i18n';
+import { modelPresetSupportsImageInput, modelSupportsImageInput, withImageInputCapability } from '../utils/multimodal';
 
 interface Props {
   currentUser: CurrentUser | null;
@@ -35,6 +36,7 @@ interface MergedModel {
   price_per_output?: number;
   max_tokens?: number;
   thinking?: ModelPreset['thinking'];
+  capabilities?: ModelPreset['capabilities'];
   owned_by?: string;
 }
 
@@ -118,11 +120,14 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
   const fetchModels = useAppStore(s => s.fetchModels);
   const deleteModel = useAppStore(s => s.deleteModel);
   const summaryModelId = useAppStore(s => s.summaryModelId);
+  const summaryAutoEnabled = useAppStore(s => s.summaryAutoEnabled);
   const setSummaryModelId = useAppStore(s => s.setSummaryModelId);
+  const setSummaryAutoEnabled = useAppStore(s => s.setSummaryAutoEnabled);
   const setProfileInjectionEnabledStore = useAppStore(s => s.setProfileInjectionEnabled);
+  const refreshServiceSettings = useAppStore(s => s.fetchWebSearchEnabled);
   const [editingModel, setEditingModel] = useState<Partial<ModelConfig> | null>(null);
   const [showAdd, setShowAdd] = useState(false);
-  const [activeTab, setActiveTab] = useState<'models' | 'usage' | 'search' | 'account'>('models');
+  const [activeTab, setActiveTab] = useState<'models' | 'usage' | 'search' | 'mineru' | 'account'>('models');
 
   // ━━━ 搜索配置状态 ━━━
   interface SearchProvider { id: string; name: string; base_url: string; api_key_hint: string; free_tier: string; pricing: string; }
@@ -133,8 +138,18 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
   const [searchSaving, setSearchSaving] = useState(false);
   const [searchSaved, setSearchSaved] = useState(false);
   const [searchLoaded, setSearchLoaded] = useState(false);
+  const [mineruLoaded, setMineruLoaded] = useState(false);
+  const [mineruApiKey, setMineruApiKey] = useState('');
+  const [mineruModelVersion, setMineruModelVersion] = useState('vlm');
+  const [mineruLanguage, setMineruLanguage] = useState('ch');
+  const [mineruEnableFormula, setMineruEnableFormula] = useState(true);
+  const [mineruEnableTable, setMineruEnableTable] = useState(true);
+  const [mineruIsOcr, setMineruIsOcr] = useState(false);
+  const [mineruSaving, setMineruSaving] = useState(false);
+  const [mineruSaved, setMineruSaved] = useState(false);
   const [profileContent, setProfileContent] = useState('');
   const [profileEnabled, setProfileEnabled] = useState(true);
+  const [profileUpdateModelId, setProfileUpdateModelIdState] = useState('');
   const [profileUpdatedAt, setProfileUpdatedAt] = useState<string | null>(null);
   const [profileHistory, setProfileHistory] = useState<UserProfileVersion[]>([]);
   const [profileLoaded, setProfileLoaded] = useState(false);
@@ -155,6 +170,19 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
     } catch { /* ignore */ }
   };
 
+  const loadMineruConfig = async () => {
+    try {
+      const settings = await api.getSettings();
+      setMineruApiKey((settings as any).mineru_api_key || '');
+      setMineruModelVersion((settings as any).mineru_model_version || 'vlm');
+      setMineruLanguage((settings as any).mineru_language || 'ch');
+      setMineruEnableFormula((settings as any).mineru_enable_formula !== 'false');
+      setMineruEnableTable((settings as any).mineru_enable_table !== 'false');
+      setMineruIsOcr((settings as any).mineru_is_ocr === 'true');
+      setMineruLoaded(true);
+    } catch { /* ignore */ }
+  };
+
   const saveSearchConfig = async () => {
     setSearchSaving(true);
     setSearchSaved(false);
@@ -170,6 +198,25 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
     setSearchSaving(false);
   };
 
+  const saveMineruConfig = async () => {
+    setMineruSaving(true);
+    setMineruSaved(false);
+    try {
+      await api.saveSettings({
+        mineru_api_key: mineruApiKey,
+        mineru_model_version: mineruModelVersion,
+        mineru_language: mineruLanguage,
+        mineru_enable_formula: String(mineruEnableFormula),
+        mineru_enable_table: String(mineruEnableTable),
+        mineru_is_ocr: String(mineruIsOcr),
+      });
+      await refreshServiceSettings();
+      setMineruSaved(true);
+      setTimeout(() => setMineruSaved(false), 2000);
+    } catch { /* ignore */ }
+    setMineruSaving(false);
+  };
+
   const loadProfile = async () => {
     try {
       const [profile, history] = await Promise.all([
@@ -178,6 +225,7 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
       ]);
       setProfileContent(profile.content || '');
       setProfileEnabled(profile.injection_enabled !== false);
+      setProfileUpdateModelIdState(profile.profile_update_model_id || '');
       setProfileUpdatedAt(profile.updated_at || null);
       setProfileHistory(history || []);
       setProfileLoaded(true);
@@ -193,8 +241,10 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
       const profile = await api.saveProfile({
         content: profileContent,
         injection_enabled: profileEnabled,
+        profile_update_model_id: profileUpdateModelId,
       });
       setProfileInjectionEnabledStore(profile.injection_enabled !== false);
+      setProfileUpdateModelIdState(profile.profile_update_model_id || '');
       setProfileUpdatedAt(profile.updated_at || null);
       setProfileSaved(true);
       setTimeout(() => setProfileSaved(false), 2000);
@@ -209,10 +259,18 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
     const profile = await api.restoreProfileVersion(versionId);
     setProfileContent(profile.content || '');
     setProfileEnabled(profile.injection_enabled !== false);
+    setProfileUpdateModelIdState(profile.profile_update_model_id || '');
     setProfileInjectionEnabledStore(profile.injection_enabled !== false);
     setProfileUpdatedAt(profile.updated_at || null);
     const history = await api.getProfileHistory();
     setProfileHistory(history || []);
+  };
+
+  const setProfileUpdateModelId = (id: string) => {
+    const validModelIds = new Set(visibleModels.map(m => m.id));
+    const nextId = validModelIds.has(id) ? id : '';
+    setProfileUpdateModelIdState(nextId);
+    api.saveSettings({ profile_update_model_id: nextId }).catch(() => {});
   };
 
   // ━━━ 快速配置流程状态 ━━━
@@ -221,6 +279,7 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
   const [selectedProvider, setSelectedProvider] = useState<ProviderPreset | null>(null);
   const [selectedModelPreset, setSelectedModelPreset] = useState<ModelPreset | null>(null);
   const [quickApiKey, setQuickApiKey] = useState('');
+  const [quickProxyUrl, setQuickProxyUrl] = useState('');
   const [quickName, setQuickName] = useState('');  // 可编辑的模型标签
   const [customMode, setCustomMode] = useState(false);
 
@@ -245,6 +304,12 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
       setSummaryModelId('');
     }
   }, [summaryModelId, visibleModels, setSummaryModelId]);
+
+  useEffect(() => {
+    if (profileUpdateModelId && !visibleModels.some(m => m.id === profileUpdateModelId)) {
+      setProfileUpdateModelId('');
+    }
+  }, [profileUpdateModelId, visibleModels]);
 
   const loadUsage = async () => {
     try {
@@ -295,6 +360,7 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
             price_per_output: mp.price_per_output,
             max_tokens: mp.max_tokens,
             thinking: mp.thinking,
+            capabilities: mp.capabilities,
             owned_by: apiMatch?.owned_by,
           });
         }
@@ -337,12 +403,18 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
       name: quickName || model.name,
       provider: selectedProvider.provider_type,
       base_url: selectedProvider.base_url,
+      proxy_url: quickProxyUrl.trim(),
       api_key: quickApiKey || undefined,
       model_name: model.model_name,
       max_tokens: model.max_tokens || 8192,
       price_per_input: model.price_per_input ?? 0,
       price_per_output: model.price_per_output ?? 0,
       price_unit: selectedProvider.currency,
+      meta: JSON.stringify({
+        capabilities: {
+          image_input: modelPresetSupportsImageInput(model),
+        },
+      }),
     };
     await api.saveModel(newModel as any);
     await fetchModels();
@@ -354,6 +426,7 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
     setSelectedModelPreset(null);
     setSelectedDiscoveredModel(null);
     setQuickApiKey('');
+    setQuickProxyUrl('');
     setQuickName('');
     setShowAdd(false);
     setEditingModel(null);
@@ -433,6 +506,7 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
       price_per_output: mp.price_per_output,
       max_tokens: mp.max_tokens,
       thinking: mp.thinking,
+      capabilities: mp.capabilities,
       owned_by: undefined,
     })) : [];
 
@@ -475,6 +549,15 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
           </button>
           <button
             onClick={() => {
+              setActiveTab('mineru');
+              if (!mineruLoaded) loadMineruConfig();
+            }}
+            className={`model-chip ${activeTab === 'mineru' ? 'active' : ''}`}
+          >
+            MinerU PDF
+          </button>
+          <button
+            onClick={() => {
               setActiveTab('account');
               if (!profileLoaded) loadProfile();
             }}
@@ -490,23 +573,35 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
               <div className="summary-model-main">
                 <div className="summary-model-copy">
                   <div className="summary-model-title">{t('autoSummary')}</div>
-                  <div className={`summary-model-status ${summaryModelId ? 'enabled' : ''}`}>
+                  <div className={`summary-model-status ${summaryAutoEnabled ? 'enabled' : ''}`}>
                     <CheckCircle2 size={13} />
-                    {summaryModelId ? (activeLanguage === 'en' ? 'Enabled' : '已启用') : (activeLanguage === 'en' ? 'Disabled' : '未启用')}
+                    {summaryAutoEnabled ? (activeLanguage === 'en' ? 'Enabled' : '已启用') : (activeLanguage === 'en' ? 'Disabled' : '未启用')}
                   </div>
                 </div>
-                <select
-                  className="summary-model-select"
-                  value={summaryModelId}
-                  onChange={e => setSummaryModelId(e.target.value)}
-                >
-                  <option value="">{t('autoSummaryOff')}</option>
-                  {visibleModels.map(model => (
-                                  <option key={model.id} value={model.id}>
-                      {localizePresetText(model.name, activeLanguage)} / {model.model_name}
-                    </option>
-                  ))}
-                </select>
+                <label className="summary-auto-switch">
+                  <input
+                    type="checkbox"
+                    checked={summaryAutoEnabled}
+                    onChange={e => setSummaryAutoEnabled(e.target.checked)}
+                  />
+                  <span className="summary-auto-switch-track" aria-hidden="true" />
+                  <span>{t('autoSummarySwitcher')}</span>
+                </label>
+              </div>
+              <select
+                className="summary-model-select"
+                value={summaryModelId}
+                onChange={e => setSummaryModelId(e.target.value)}
+              >
+                <option value="">{t('summaryModelPlaceholder')}</option>
+                {visibleModels.map(model => (
+                  <option key={model.id} value={model.id}>
+                    {localizePresetText(model.name, activeLanguage)} / {model.model_name}
+                  </option>
+                ))}
+              </select>
+              <div className="summary-model-hint">
+                {summaryAutoEnabled && !summaryModelId ? t('autoSummaryModelRequired') : t('manualSummaryModelHint')}
               </div>
               <div className="summary-model-notes">
                 <span>{t('autoSummaryNote1')}</span>
@@ -523,6 +618,12 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                     <div className="model-list-info">
                       <div className="model-list-name">
                         {localizePresetText(model.name, activeLanguage)}
+                        {modelSupportsImageInput(model) && (
+                          <span className="vision-badge" title={activeLanguage === 'en' ? 'Supports image input' : '支持图片输入'}>
+                            <ImageIcon size={12} />
+                            {activeLanguage === 'en' ? 'Vision' : '视觉'}
+                          </span>
+                        )}
                       </div>
                       <div className="model-list-detail">
                         {getProviderDisplayName(model)} / {model.model_name}
@@ -578,7 +679,7 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                             className="provider-card provider-card-custom"
                             onClick={() => {
                               setCustomMode(true);
-                              setEditingModel({ id: '', name: '', provider: 'custom', model_name: '', base_url: '', api_key: '', max_tokens: 4096, price_per_input: 0, price_per_output: 0, price_unit: 'CNY' });
+                              setEditingModel({ id: '', name: '', provider: 'custom', model_name: '', base_url: '', proxy_url: '', api_key: '', max_tokens: 4096, price_per_input: 0, price_per_output: 0, price_unit: 'CNY' });
                             }}
                           >
                             <span className="provider-logo" style={{ width: 24, height: 24, display: 'inline-flex', flexShrink: 0 }} dangerouslySetInnerHTML={{ __html: '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><rect width="24" height="24" rx="6" fill="#888"/><path d="M12 8a1.5 1.5 0 110-3 1.5 1.5 0 010 3zm0 5.5a1.5 1.5 0 110-3 1.5 1.5 0 010 3zm0 5.5a1.5 1.5 0 110-3 1.5 1.5 0 010 3z" fill="white"/></svg>' }} />
@@ -663,6 +764,12 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                                 </div>
                                 <div className="model-preset-meta">
                                   <span className="model-preset-id">{mm.model_name}</span>
+                                  {modelPresetSupportsImageInput(mm) && (
+                                    <span className="vision-badge">
+                                      <ImageIcon size={12} />
+                                      {activeLanguage === 'en' ? 'Vision' : '视觉'}
+                                    </span>
+                                  )}
                                   {mm.thinking && <span className="thinking-badge"><Activity size={12} style={{verticalAlign:'-1px',marginRight:3}} /> {t('deepThinking')}</span>}
                                   {mm.owned_by && <span className="owned-by">{mm.owned_by}</span>}
                                 </div>
@@ -732,6 +839,15 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                               <span className="qc-value thinking-available"><Activity size={12} style={{verticalAlign:'-1px',marginRight:3}} /> {t('thinkingSupported')}</span>
                             </div>
                           )}
+                          {modelPresetSupportsImageInput(selectedModelPreset || selectedDiscoveredModel) && (
+                            <div className="qc-row">
+                              <span className="qc-label">{activeLanguage === 'en' ? 'Image input' : '图片输入'}</span>
+                              <span className="qc-value vision-available">
+                                <ImageIcon size={12} />
+                                {activeLanguage === 'en' ? 'Supported' : '支持'}
+                              </span>
+                            </div>
+                          )}
                           <div className="qc-row">
                             <span className="qc-label">{t('price')}</span>
                             <span className="qc-value">
@@ -760,6 +876,18 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                             onChange={e => setQuickApiKey(e.target.value)}
                             placeholder={localizePresetText(selectedProvider.api_key_hint, activeLanguage)}
                           />
+                        </div>
+                        <div className="qc-api-key-section">
+                          <label className="qc-api-key-label">{t('proxyUrl')}</label>
+                          <input
+                            className="qc-api-key-input"
+                            value={quickProxyUrl}
+                            onChange={e => setQuickProxyUrl(e.target.value)}
+                            placeholder={t('proxyUrlPlaceholder')}
+                          />
+                          <div className="field-hint">
+                            {t('proxyUrlHint')}
+                          </div>
                         </div>
                         <div className="btn-group">
                           <button onClick={resetQuickAdd} className="btn btn-outline">{t('cancel')}</button>
@@ -814,6 +942,17 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                         onChange={e => setEditingModel({ ...editingModel, base_url: e.target.value })}
                         placeholder="https://api.example.com/v1"
                       />
+                      <div className="custom-form-field">
+                        <label>{t('proxyUrl')}</label>
+                        <input
+                          value={editingModel?.proxy_url || ''}
+                          onChange={e => setEditingModel({ ...editingModel, proxy_url: e.target.value })}
+                          placeholder={t('proxyUrlPlaceholder')}
+                        />
+                        <div className="field-hint">
+                          {t('proxyUrlHint')}
+                        </div>
+                      </div>
                       <label>API Key</label>
                       <input
                         type="password"
@@ -821,6 +960,14 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                         onChange={e => setEditingModel({ ...editingModel, api_key: e.target.value })}
                         placeholder="sk-..."
                       />
+                      <label className="custom-checkbox-row">
+                        <input
+                          type="checkbox"
+                          checked={modelSupportsImageInput(editingModel)}
+                          onChange={e => setEditingModel(withImageInputCapability(editingModel || {}, e.target.checked))}
+                        />
+                        <span>{activeLanguage === 'en' ? 'Supports image input' : '支持图片输入'}</span>
+                      </label>
                       <label>Max Tokens</label>
                       <input
                         type="number"
@@ -902,7 +1049,8 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                       .sort((a, b) => {
                         // 第一级：未删除在先，已删除在后
                         if (a.deleted !== b.deleted) return (a.deleted ?? 0) - (b.deleted ?? 0);
-                        // 第二级：总 token 量降序
+                        // 第二级：调用次数降序；同次数时用总 token 量兜底
+                        if (a.call_count !== b.call_count) return b.call_count - a.call_count;
                         return b.total_tokens - a.total_tokens;
                       })
                       .map((u: TokenUsage) => (
@@ -1036,6 +1184,89 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
           </div>
         )}
 
+        {activeTab === 'mineru' && (
+          <div>
+            {!mineruLoaded ? (
+              <p style={{ color: 'var(--megaform-text-secondary)', textAlign: 'center', padding: 24 }}>{t('loading')}</p>
+            ) : (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                <div>
+                  <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--megaform-text)', marginBottom: 4 }}>
+                    MinerU PDF
+                  </div>
+                  <div style={{ fontSize: 12, color: 'var(--megaform-text-secondary)' }}>
+                    {activeLanguage === 'en'
+                      ? 'Used by the PDF upload button to convert papers into Markdown responses.'
+                      : '用于输入栏 PDF 上传入口，把论文转成 Markdown response。'}
+                  </div>
+                </div>
+
+                <div>
+                  <label style={{ fontSize: 13, fontWeight: 500, marginBottom: 4, display: 'block', color: 'var(--megaform-text-secondary)' }}>
+                    MinerU API Key
+                  </label>
+                  <input
+                    type="password"
+                    value={mineruApiKey}
+                    onChange={e => setMineruApiKey(e.target.value)}
+                    placeholder={activeLanguage === 'en' ? 'MinerU API token' : 'MinerU 官网申请的 API Token'}
+                    className="config-input"
+                    style={{ width: '100%', fontFamily: 'monospace', fontSize: 13 }}
+                  />
+                </div>
+
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10 }}>
+                  <label style={{ fontSize: 13, color: 'var(--megaform-text-secondary)' }}>
+                    <span style={{ display: 'block', marginBottom: 4 }}>{activeLanguage === 'en' ? 'Model' : '模型'}</span>
+                    <select className="config-input" value={mineruModelVersion} onChange={e => setMineruModelVersion(e.target.value)}>
+                      <option value="vlm">vlm</option>
+                      <option value="pipeline">pipeline</option>
+                    </select>
+                  </label>
+                  <label style={{ fontSize: 13, color: 'var(--megaform-text-secondary)' }}>
+                    <span style={{ display: 'block', marginBottom: 4 }}>{activeLanguage === 'en' ? 'Language' : '语言'}</span>
+                    <input
+                      className="config-input"
+                      value={mineruLanguage}
+                      onChange={e => setMineruLanguage(e.target.value)}
+                      placeholder="ch / en"
+                    />
+                  </label>
+                </div>
+
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, fontSize: 13, color: 'var(--megaform-text-secondary)' }}>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
+                    <input type="checkbox" checked={mineruEnableFormula} onChange={e => setMineruEnableFormula(e.target.checked)} />
+                    {activeLanguage === 'en' ? 'Formula recognition' : '公式识别'}
+                  </label>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
+                    <input type="checkbox" checked={mineruEnableTable} onChange={e => setMineruEnableTable(e.target.checked)} />
+                    {activeLanguage === 'en' ? 'Table recognition' : '表格识别'}
+                  </label>
+                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
+                    <input type="checkbox" checked={mineruIsOcr} onChange={e => setMineruIsOcr(e.target.checked)} />
+                    OCR
+                  </label>
+                </div>
+
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <button
+                    onClick={saveMineruConfig}
+                    disabled={mineruSaving}
+                    className="model-chip active"
+                    style={{ fontWeight: 500 }}
+                  >
+                    {mineruSaving ? t('saving') : (activeLanguage === 'en' ? 'Save MinerU config' : '保存 MinerU 配置')}
+                  </button>
+                  {mineruSaved && (
+                    <span style={{ color: 'var(--megaform-stone-600)', fontSize: 13 }}><CheckCircle2 size={13} style={{verticalAlign:'-2px',marginRight:3}} /> {t('saved')}</span>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {activeTab === 'account' && (
           <div className="account-settings">
             <div className="account-settings-card">
@@ -1112,6 +1343,27 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                     <span className="profile-updated">
                       {profileUpdatedAt ? t('updatedAt', { time: profileUpdatedAt }) : t('notSaved')}
                     </span>
+                  </div>
+                  <div className="profile-auto-update">
+                    <div className="profile-auto-update-label">
+                      <Bot size={14} />
+                      <span>{t('profileAutoUpdateModel')}</span>
+                    </div>
+                    <select
+                      className="summary-model-select"
+                      value={profileUpdateModelId}
+                      onChange={e => setProfileUpdateModelId(e.target.value)}
+                    >
+                      <option value="">{t('profileAutoUpdateOff')}</option>
+                      {visibleModels.map(model => (
+                        <option key={model.id} value={model.id}>
+                          {localizePresetText(model.name, activeLanguage)} / {model.model_name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="profile-auto-update-note">
+                    {t('profileAutoUpdateNote')}
                   </div>
                   <textarea
                     className="profile-editor"

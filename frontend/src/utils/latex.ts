@@ -14,51 +14,56 @@
  */
 import katex from 'katex';
 
+function escapeAttr(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function renderLatexWithSource(source: string, math: string, displayMode: boolean): string {
+  const rendered = katex.renderToString(math, {
+    displayMode,
+    throwOnError: false,
+    strict: false,
+  });
+  return `<span class="latex-source" data-latex-source="${escapeAttr(source)}">${rendered}</span>`;
+}
+
 export function renderLatex(content: string): string {
   let result = content;
 
   // ── Step 1: 块级公式 \[...\]（LaTeX 标准 display） ──
-  result = result.replace(/\\\[([\s\S]*?)\\\]/g, (_match, math: string) => {
+  result = result.replace(/\\\[([\s\S]*?)\\\]/g, (match, math: string) => {
     const trimmed = math.trim();
-    if (!trimmed) return _match;
+    if (!trimmed) return match;
     try {
-      return katex.renderToString(trimmed, {
-        displayMode: true,
-        throwOnError: false,
-        strict: false,
-      });
+      return renderLatexWithSource(match, trimmed, true);
     } catch {
-      return _match;
+      return match;
     }
   });
 
   // ── Step 2: 块级公式 $$...$$（允许跨行） ──
-  result = result.replace(/\$\$([\s\S]*?)\$\$/g, (_match, math: string) => {
+  result = result.replace(/\$\$([\s\S]*?)\$\$/g, (match, math: string) => {
     const trimmed = math.trim();
-    if (!trimmed) return _match;
+    if (!trimmed) return match;
     try {
-      return katex.renderToString(trimmed, {
-        displayMode: true,
-        throwOnError: false,
-        strict: false,
-      });
+      return renderLatexWithSource(match, trimmed, true);
     } catch {
-      return _match;
+      return match;
     }
   });
 
   // ── Step 3: 行内公式 \(...\)（LaTeX 标准 inline） ──
-  result = result.replace(/\\\(([\s\S]*?)\\\)/g, (_match, math: string) => {
+  result = result.replace(/\\\(([\s\S]*?)\\\)/g, (match, math: string) => {
     const trimmed = math.trim();
-    if (!trimmed) return _match;
+    if (!trimmed) return match;
     try {
-      return katex.renderToString(trimmed, {
-        displayMode: false,
-        throwOnError: false,
-        strict: false,
-      });
+      return renderLatexWithSource(match, trimmed, false);
     } catch {
-      return _match;
+      return match;
     }
   });
 
@@ -69,11 +74,7 @@ export function renderLatex(content: string): string {
     if (!trimmed) return match;
     if (/^\d+(\.\d+)?$/.test(trimmed)) return match; // $100 / $3.50
     try {
-      return katex.renderToString(trimmed, {
-        displayMode: false,
-        throwOnError: false,
-        strict: false,
-      });
+      return renderLatexWithSource(match, trimmed, false);
     } catch {
       return match;
     }

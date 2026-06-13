@@ -18,6 +18,8 @@ export interface Node {
   summary: string;      // 节点摘要（折叠时展示）
   pinned: number;       // 根节点是否置顶 (0/1)，普通节点通常为 0
   archived: number;     // 根节点是否归档 (0/1)，普通节点通常为 0
+  group_id: string | null; // 根节点所在侧边栏分组，null 表示默认“对话”
+  group_order: number | null; // 旧字段：组内排序现在统一按 updated_at
   meta: string;         // JSON string
   created_at: string;
   updated_at: string;
@@ -32,6 +34,16 @@ export type Root = Node & {
   archived: number;
   node_count?: number;
 };
+
+export interface RootGroup {
+  id: string;
+  user_id: string;
+  name: string;
+  sort_order: number;
+  collapsed: number;
+  created_at: string;
+  updated_at: string;
+}
 
 /** 模型回复 */
 export interface Response {
@@ -71,6 +83,7 @@ export interface ModelConfig {
   name: string;           // 前端显示名
   provider: string;       // 供应商类型标识: openai / deepseek / ollama / anthropic / custom
   base_url: string | null;
+  proxy_url: string | null;  // 可选本地代理地址，如 http://127.0.0.1:7890
   api_key: string | null;
   model_name: string;     // 模型标识（如 gpt-4o）
   max_tokens: number;
@@ -119,6 +132,7 @@ export interface UserProfile {
   current_version_id: string | null;
   updated_at: string | null;
   injection_enabled: boolean;
+  profile_update_model_id: string;
 }
 
 export interface UserProfileVersion {
@@ -143,6 +157,13 @@ export interface ChatRequest {
   logic_node?: boolean;             // 无模型时创建逻辑节点，不请求模型答复
   thinking_budgets?: Record<string, number>;  // {model_id: thinking_budget}
   use_profile?: boolean;            // 是否把用户全局 Profile 注入 system prompt
+  attachments?: Array<{
+    type: 'image';
+    name: string;
+    mime_type: string;
+    data_url: string;
+    size: number;
+  }>;
 }
 
 /** 单个模型返回结果 */

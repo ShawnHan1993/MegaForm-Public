@@ -21,6 +21,7 @@
 
 import { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
+import { AnimatePresence, motion } from 'framer-motion';
 import { useAppStore } from '../store/appStore';
 import { getThinkingDepthClass, getThinkingLevels, type ThinkingLevel } from '../data/thinkingPresets';
 import type { Response as RespType, Node, Nut } from '../types';
@@ -44,6 +45,136 @@ function formatUrlsInText(text: string): string {
   });
 }
 
+function isScrolledToBottom(element: HTMLElement): boolean {
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= 4;
+}
+
+function ThinkingSection({
+  thinking,
+  isThinking,
+  label,
+}: {
+  thinking: string;
+  isThinking: boolean;
+  label: string;
+}) {
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const shouldStickToBottomRef = useRef(true);
+
+  useLayoutEffect(() => {
+    const el = contentRef.current;
+    if (!el || !shouldStickToBottomRef.current) return;
+    el.scrollTop = el.scrollHeight;
+  }, [thinking]);
+
+  const handleThinkingScroll = useCallback(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    shouldStickToBottomRef.current = isScrolledToBottom(el);
+  }, []);
+
+  return (
+    <div className="streaming-status-bar">
+      <div className="thinking-section">
+        <details open={isThinking} className="thinking-details">
+          <summary className="thinking-summary">
+            <Activity size={14} style={{verticalAlign:'-2px',marginRight:4}} /> {label}
+            {isThinking && <span className="thinking-cursor">▌</span>}
+          </summary>
+          <div
+            ref={contentRef}
+            className="thinking-content"
+            onScroll={handleThinkingScroll}
+          >
+            <MarkdownContent content={formatUrlsInText(thinking)} />
+          </div>
+        </details>
+      </div>
+    </div>
+  );
+}
+
+function rangeIntersectsNode(range: Range, node: globalThis.Node): boolean {
+  try {
+    return range.intersectsNode(node);
+  } catch {
+    return false;
+  }
+}
+
+function isHiddenKatexNode(element: Element): boolean {
+  return Boolean(
+    element.closest('.katex-mathml') ||
+    element.closest('[aria-hidden="true"]')
+  );
+}
+
+function getFollowupSelectionText(selection: Selection): string {
+  const fallback = selection.toString().trim();
+  if (!selection.rangeCount) return fallback;
+
+  const range = selection.getRangeAt(0);
+  const root = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+    ? range.commonAncestorContainer
+    : range.commonAncestorContainer.parentElement;
+  if (!(root instanceof Element)) return fallback;
+
+  const closestLatex = root.closest<HTMLElement>('.latex-source[data-latex-source]');
+  const latexElements = [
+    ...(closestLatex ? [closestLatex] : []),
+    ...Array.from(root.querySelectorAll<HTMLElement>('.latex-source[data-latex-source]')),
+  ]
+    .filter(el => rangeIntersectsNode(range, el));
+  if (latexElements.length === 0) return fallback;
+
+  const chunks: string[] = [];
+  const seenLatex = new Set<HTMLElement>();
+
+  const walk = (node: globalThis.Node) => {
+    if (!rangeIntersectsNode(range, node)) return;
+
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const element = node as Element;
+      if (isHiddenKatexNode(element)) return;
+
+      if (element instanceof HTMLElement && element.matches('.latex-source[data-latex-source]')) {
+        if (!seenLatex.has(element)) {
+          chunks.push(element.dataset.latexSource || '');
+          seenLatex.add(element);
+        }
+        return;
+      }
+
+      element.childNodes.forEach(walk);
+      return;
+    }
+
+    if (node.nodeType === Node.TEXT_NODE) {
+      const parent = node.parentElement;
+      if (!parent || parent.closest('.latex-source') || isHiddenKatexNode(parent)) return;
+
+      let start = 0;
+      let end = node.textContent?.length || 0;
+      if (node === range.startContainer) start = range.startOffset;
+      if (node === range.endContainer) end = range.endOffset;
+      if (start < end) chunks.push((node.textContent || '').slice(start, end));
+    }
+  };
+
+  walk(root);
+  return chunks.join('').replace(/\s+/g, ' ').trim() || fallback;
+}
+
+function hasLatex(text: string): boolean {
+  return /(\$\$[\s\S]+?\$\$|\$[^$\n]+?\$|\\\([\s\S]+?\\\)|\\\[[\s\S]+?\\\])/.test(text);
+}
+
+function getFollowupLabelPreview(text: string): string {
+  if (hasLatex(text)) return text;
+  const chars = Array.from(text);
+  return chars.length > 30 ? chars.slice(0, 30).join('') + '...' : text;
+}
+
 interface Props {
   nodeId: string;
   responses: RespType[];
@@ -53,6 +184,8 @@ interface Props {
   streamingResponses?: Record<string, import('../types').StreamingResponse>;
   /** 当前节点是否正在流式 */
   isStreamingNode?: boolean;
+  /** 相机下钻提交帧：禁用 model chip 的 mount/layout 动画 */
+  suppressModelChipAnimation?: boolean;
 }
 
 /**
@@ -262,11 +395,31 @@ const PENDING_FOLLOWUP_ID = '__pending_followup__';
 // ═══════════════════════════════════════════════════════════════
 // ResponseArea 主组件
 // ═══════════════════════════════════════════════════════════════
-export default function ResponseArea({ nodeId, responses, followupChildren, immersive, streamingResponses, isStreamingNode }: Props) {
+export default function ResponseArea({
+  nodeId,
+  responses,
+  followupChildren,
+  immersive,
+  streamingResponses,
+  isStreamingNode,
+  suppressModelChipAnimation = false,
+}: Props) {
   const language = useLanguage();
   const t = useT();
   const models = useAppStore(s => s.models);
-  const visibleModels = models.filter(m => m.deleted !== 1);
+  const visibleModels = (() => {
+    return models
+      .map((model, index) => ({ model, index }))
+      .filter(({ model }) => model.deleted !== 1)
+      .sort((a, b) => {
+        const usageDiff = (b.model.recent_usage_count || 0) - (a.model.recent_usage_count || 0);
+        if (usageDiff !== 0) return usageDiff;
+        const tokenDiff = (b.model.recent_token_usage || 0) - (a.model.recent_token_usage || 0);
+        if (tokenDiff !== 0) return tokenDiff;
+        return a.index - b.index;
+      })
+      .map(({ model }) => model);
+  })();
   const activeModelId = useAppStore(s => s.activeModelId);
   const setActiveModelId = useAppStore(s => s.setActiveModelId);
   const sendingMessage = useAppStore(s => s.sendingMessage);
@@ -274,6 +427,22 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
   const currentRootId = useAppStore(s => s.currentRootId);
   const selectedModelIds = useAppStore(s => s.selectedModelIds);
   const setSelectedModelIds = useAppStore(s => s.setSelectedModelIds);
+  const followupVisibleModels = useMemo(() => {
+    const selectedIds = new Set(selectedModelIds);
+    return models
+      .map((model, index) => ({ model, index }))
+      .filter(({ model }) => model.deleted !== 1)
+      .sort((a, b) => {
+        const selectedDiff = Number(selectedIds.has(b.model.id)) - Number(selectedIds.has(a.model.id));
+        if (selectedDiff !== 0) return selectedDiff;
+        const usageDiff = (b.model.recent_usage_count || 0) - (a.model.recent_usage_count || 0);
+        if (usageDiff !== 0) return usageDiff;
+        const tokenDiff = (b.model.recent_token_usage || 0) - (a.model.recent_token_usage || 0);
+        if (tokenDiff !== 0) return tokenDiff;
+        return a.index - b.index;
+      })
+      .map(({ model }) => model);
+  }, [models, selectedModelIds]);
   const webSearchEnabled = useAppStore(s => s.webSearchEnabled);
   const setWebSearchEnabled = useAppStore(s => s.setWebSearchEnabled);
   const thinkingBudgets = useAppStore(s => s.thinkingBudgets);
@@ -285,6 +454,7 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
   const toggleCollapse = useAppStore(s => s.toggleCollapse);
   const focusNode = useAppStore(s => s.focusNode);
   const getDeepestPathModels = useAppStore(s => s.getDeepestPathModels);
+  const searchScrollTarget = useAppStore(s => s.searchScrollTarget);
 
   // ━━━ 文本选择追问状态 ━━━
   // selectionInfo: 当前选中文字的位置+元信息
@@ -313,15 +483,77 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
   const [deletingResponseId, setDeletingResponseId] = useState<string | null>(null);
   const addModelMenuRef = useRef<HTMLDivElement>(null);
   const addModelBtnRef = useRef<HTMLButtonElement>(null);
+  const followupToolRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const previousFollowupToolLayoutRef = useRef<{
+    rects: Map<string, DOMRect>;
+    order: Map<string, number>;
+    selectedIds: Set<string>;
+  } | null>(null);
 
   const [addModelMenuPos, setAddModelMenuPos] = useState({ top: 0, left: 0 });
+
+  useLayoutEffect(() => {
+    const currentRects = new Map<string, DOMRect>();
+    const currentOrder = new Map<string, number>();
+
+    followupVisibleModels.forEach((model, index) => {
+      const element = followupToolRefs.current.get(model.id);
+      if (!element) return;
+      currentRects.set(model.id, element.getBoundingClientRect());
+      currentOrder.set(model.id, index);
+    });
+
+    const previousLayout = previousFollowupToolLayoutRef.current;
+    const currentSelectedIds = new Set(selectedModelIds);
+    if (previousLayout) {
+      const selectionChanged =
+        previousLayout.selectedIds.size !== currentSelectedIds.size ||
+        selectedModelIds.some(id => !previousLayout.selectedIds.has(id));
+
+      if (selectionChanged) {
+        followupVisibleModels.forEach((model, index) => {
+          const previousIndex = previousLayout.order.get(model.id);
+          if (previousIndex === undefined || previousIndex === index) return;
+
+          const element = followupToolRefs.current.get(model.id);
+          const previousRect = previousLayout.rects.get(model.id);
+          const currentRect = currentRects.get(model.id);
+          if (!element || !previousRect || !currentRect) return;
+
+          const deltaX = previousRect.left - currentRect.left;
+          if (deltaX === 0) return;
+
+          element.getAnimations().forEach(animation => animation.cancel());
+          element.animate(
+            [
+              { transform: `translateX(${deltaX}px)` },
+              { transform: 'translateX(0)' },
+            ],
+            {
+              duration: 320,
+              easing: 'cubic-bezier(0.2, 0, 0, 1)',
+            },
+          );
+        });
+      }
+    }
+
+    previousFollowupToolLayoutRef.current = {
+      rects: currentRects,
+      order: currentOrder,
+      selectedIds: currentSelectedIds,
+    };
+  }, [followupVisibleModels, selectedModelIds]);
 
   useEffect(() => {
     if (showAddModelMenu && addModelBtnRef.current) {
       const updatePos = () => {
         if (addModelBtnRef.current) {
           const rect = addModelBtnRef.current.getBoundingClientRect();
-          setAddModelMenuPos({ top: rect.bottom + 4, left: rect.left });
+          const estWidth = 260;
+          const margin = 8;
+          const left = Math.min(rect.left, window.innerWidth - estWidth - margin);
+          setAddModelMenuPos({ top: rect.bottom + 4, left: Math.max(margin, left) });
         }
       };
       updatePos();
@@ -350,12 +582,20 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
     return () => document.removeEventListener('mousedown', handler);
   }, [showAddModelMenu]);
   const popoverRef = useRef<HTMLDivElement>(null);
+  const thinkingPopoverTriggerRef = useRef<HTMLElement | null>(null);
+  const suppressNextFollowupThinkingClickRef = useRef(false);
 
   // 点击外部 → 关闭 popover
   useEffect(() => {
     if (!thinkingPopoverFor) return;
     const handler = (e: MouseEvent) => {
-      if (popoverRef.current && !popoverRef.current.contains(e.target as HTMLElement)) {
+      const target = e.target as HTMLElement;
+      if (
+        popoverRef.current &&
+        !popoverRef.current.contains(target) &&
+        !thinkingPopoverTriggerRef.current?.contains(target)
+      ) {
+        thinkingPopoverTriggerRef.current = null;
         setThinkingPopoverFor(null);
         setThinkingPopoverPosition(null);
       }
@@ -381,12 +621,67 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
 
   const toggleThinkingPopover = (modelId: string, target: HTMLElement) => {
     const isClosing = thinkingPopoverFor === modelId;
+    thinkingPopoverTriggerRef.current = isClosing ? null : target;
     setThinkingPopoverFor(isClosing ? null : modelId);
     setThinkingPopoverPosition(isClosing ? null : getMobileThinkingPopoverPosition(target));
   };
 
+  const openFollowupThinkingPopoverFromTouch = (modelId: string, target: HTMLElement) => {
+    suppressNextFollowupThinkingClickRef.current = true;
+    thinkingPopoverTriggerRef.current = target;
+    setThinkingPopoverFor(modelId);
+    setThinkingPopoverPosition(getMobileThinkingPopoverPosition(target));
+  };
+
   const getModelThinkingLevels = (model: { provider: string; model_name: string }): ThinkingLevel[] | undefined => {
     return getThinkingLevels(model.provider, model.model_name);
+  };
+
+  const renderFollowupThinkingPopover = (
+    modelId: string,
+    thinkingLevels: ThinkingLevel[],
+    currentBudget: number,
+  ) => {
+    const popover = (
+      <div
+        className={`thinking-popover${thinkingPopoverPosition ? ' mobile-fixed' : ''}`}
+        ref={popoverRef}
+        style={thinkingPopoverPosition ? {
+          left: thinkingPopoverPosition.left,
+          bottom: thinkingPopoverPosition.bottom,
+        } : undefined}
+      >
+        <div className="thinking-popover-title"><Activity size={14} style={{ verticalAlign: '-2px', marginRight: 4 }} /> {t('thinkingDepth')}</div>
+        {thinkingLevels.map(level => (
+          <button
+            key={level.budget}
+            className={`thinking-level-btn ${currentBudget === level.budget ? 'active' : ''}`}
+            onClick={() => {
+              setThinkingBudget(modelId, level.budget);
+              thinkingPopoverTriggerRef.current = null;
+              setThinkingPopoverFor(null);
+              setThinkingPopoverPosition(null);
+            }}
+          >
+            <span className="thinking-level-label">{localizeThinkingLabel(level.label, language)}</span>
+            <span className="thinking-level-desc">{localizeThinkingDescription(level.description, language)}</span>
+          </button>
+        ))}
+        <button
+          className="thinking-level-btn"
+          onClick={() => {
+            setThinkingBudget(modelId, 0);
+            thinkingPopoverTriggerRef.current = null;
+            setThinkingPopoverFor(null);
+            setThinkingPopoverPosition(null);
+          }}
+        >
+          <X size={12} style={{ verticalAlign: '-2px', marginRight: 3 }} /> {t('disableThinking')}
+        </button>
+      </div>
+    );
+
+    return thinkingPopoverPosition ? createPortal(popover, document.body) : popover;
   };
 
   const savedSelectionRef = useRef<Range | null>(null);
@@ -597,6 +892,15 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
     response: RespType,
     modelFollowups: Node[],
   ) => {
+    const responseSearchHit = searchScrollTarget?.type === 'response'
+      && searchScrollTarget.nodeId === nodeId
+      && searchScrollTarget.modelId === response.model_id
+      ? {
+          query: searchScrollTarget.query,
+          hitId: `search-${searchScrollTarget.requestId}`,
+        }
+      : null;
+
     let nuts = [...(response.nuts || [])];
     const followupByNutId = buildFollowupByNutId(modelFollowups);
     const collapsedNutIds = getCollapsedNutIds(modelFollowups);
@@ -637,6 +941,8 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
             summary: '',
             pinned: 0,
             archived: 0,
+            group_id: null,
+            group_order: null,
             meta: '{}',
             updated_at: new Date().toISOString(),
             children: [],
@@ -674,6 +980,8 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                 collapsedNutIds={immersive ? new Set() : collapsedNutIds}
                 pendingNutIds={immersive ? new Set() : pendingNutIds}
                 onCollapsedNutClick={handleCollapsedNutClick}
+                searchQuery={responseSearchHit?.query}
+                searchHitId={responseSearchHit?.hitId}
               />
             );
           } else {
@@ -711,7 +1019,12 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                   onMouseLeave={() => setHoveredNutId(null)}
                 >
                   {seg.nodes.map(child => (
-                    <NodeCard key={child.id} node={child} depth={1} />
+                    <NodeCard
+                      key={child.id}
+                      node={child}
+                      depth={1}
+                      suppressEnterAnimation={suppressModelChipAnimation}
+                    />
                   ))}
                 </div>
               );
@@ -728,7 +1041,9 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                 <div className="followup-inline-anchor">
                   <span className="followup-inline-icon"><ArrowRightFromLine size={14} /></span>
                   {seg.nut.label && (
-                    <span className="followup-inline-label">「{seg.nut.label}」</span>
+                    <span className="followup-inline-label">
+                      「<MarkdownContent content={seg.nut.label} inline />」
+                    </span>
                   )}
                   {seg.nodes.length > 0 && seg.nodes[0].parent_model_id && (
                     <span className="followup-inline-model">
@@ -737,7 +1052,12 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                   )}
                 </div>
                 {seg.nodes.map(child => (
-                  <NodeCard key={child.id} node={child} depth={1} />
+                  <NodeCard
+                    key={child.id}
+                    node={child}
+                    depth={1}
+                    suppressEnterAnimation={suppressModelChipAnimation}
+                  />
                 ))}
               </div>
             );
@@ -746,7 +1066,12 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
         {withoutNut.length > 0 && (
           <div className="followup-children">
             {withoutNut.map(child => (
-              <NodeCard key={child.id} node={child} depth={1} />
+              <NodeCard
+                key={child.id}
+                node={child}
+                depth={1}
+                suppressEnterAnimation={suppressModelChipAnimation}
+              />
             ))}
           </div>
         )}
@@ -770,7 +1095,7 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
         return;
       }
 
-      const selectedText = selection.toString().trim();
+      const selectedText = getFollowupSelectionText(selection);
       if (!selectedText) return;
 
       const anchorNode = selection.anchorNode;
@@ -902,6 +1227,8 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
       const target = e.target as Element;
       // 点击追问容器内部时不关闭
       if (target.closest('.followup-container')) return;
+      if (target.closest('.followup-input-popup')) return;
+      if (target.closest('.thinking-popover')) return;
       // 移动端：touchend 后浏览器会合成 mousedown，在 500ms 内忽略，防止选中文字后 tooltip 被立即清除
       if (Date.now() - lastTouchTimeRef.current < 500) return;
       // 有 selectionInfo 就清除（tooltip 或输入弹窗都统一关闭）
@@ -945,9 +1272,11 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
 
   // 发送追问: 创建 pendingFollowup (loading 态) → API 调用 → 创建 followup 节点
   const submitFollowup = async () => {
-    if (!selectionInfo || !followupInput.trim() || !currentRootId) return;
+    if (!selectionInfo || !currentRootId) return;
 
-    const savedFollowupInput = followupInput;
+    const savedFollowupInput = followupInput.trim()
+      ? followupInput
+      : t('defaultFollowupExplainMeaning');
     const savedSelectionInfo = { ...selectionInfo };
 
     setSendingFollowup(true);
@@ -1003,19 +1332,11 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
       >
         {/* 流式状态栏：思考过程 */}
         {!!s && s!.thinking && (
-          <div className="streaming-status-bar">
-            <div className="thinking-section">
-              <details open={isThinking} className="thinking-details">
-                <summary className="thinking-summary">
-                  <Activity size={14} style={{verticalAlign:'-2px',marginRight:4}} /> {t('thinkingProcess')}
-                  {isThinking && <span className="thinking-cursor">▌</span>}
-                </summary>
-                <div className="thinking-content">
-                  <MarkdownContent content={formatUrlsInText(s!.thinking)} />
-                </div>
-              </details>
-            </div>
-          </div>
+          <ThinkingSection
+            thinking={s!.thinking}
+            isThinking={isThinking}
+            label={t('thinkingProcess')}
+          />
         )}
 
         {/* 正文内容：流式/刚完成时用 streaming content，否则用保存的 */}
@@ -1146,63 +1467,73 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
     <div className="response-area" ref={responseAreaRef} style={{ WebkitTouchCallout: 'none' }}>
       {/* 模型选择栏 */}
       <div className="model-bar" data-frozen-anchor={nodeId}>
-        {allModelIds.map(mid => {
-          const isActive = mid === effectiveCurrentModelId || (!effectiveCurrentModelId && mid === allModelIds[0]);
-          const isStreamingModel = streamingModelIds.includes(mid);
-          const isDeleted = isDeletedModel(mid);
-          const savedResponse = responses.find(r => r.model_id === mid);
-          const isOnDeepestPath = deepestPathSet.has(`${nodeId}:${mid}`);
-          const isActivelyStreaming = isStreamingModel && (
-            streamingResponses?.[mid]?.status === 'thinking' ||
-            streamingResponses?.[mid]?.status === 'responding'
-          );
-          return (
-            <span className="model-chip-wrap" key={mid}>
-              <button
-                data-model-id={mid}
-                className={`model-chip ${isActive ? 'active' : ''} ${isActivelyStreaming ? 'model-streaming' : ''} ${isDeleted ? 'deleted-model' : ''}`}
-                onClick={() => setActiveModelId(nodeId, mid)}
-                title={isDeleted ? t('deletedModelTitle') : undefined}
+        <AnimatePresence initial={false} mode="popLayout">
+          {allModelIds.map(mid => {
+            const isActive = mid === effectiveCurrentModelId || (!effectiveCurrentModelId && mid === allModelIds[0]);
+            const isStreamingModel = streamingModelIds.includes(mid);
+            const isDeleted = isDeletedModel(mid);
+            const savedResponse = responses.find(r => r.model_id === mid);
+            const isOnDeepestPath = deepestPathSet.has(`${nodeId}:${mid}`);
+            const isActivelyStreaming = isStreamingModel && (
+              streamingResponses?.[mid]?.status === 'thinking' ||
+              streamingResponses?.[mid]?.status === 'responding'
+            );
+            return (
+              <motion.span
+                className="model-chip-wrap"
+                key={mid}
+                layout={!suppressModelChipAnimation}
+                initial={suppressModelChipAnimation ? false : { opacity: 0, scale: 0.92, y: -3 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={suppressModelChipAnimation ? { opacity: 0 } : { opacity: 0, scale: 0.78, y: -8 }}
+                transition={suppressModelChipAnimation ? { duration: 0 } : { type: 'spring', stiffness: 520, damping: 34, mass: 0.55 }}
               >
-                {isActivelyStreaming && (
-                  <svg className="model-chip-border" aria-hidden="true" focusable="false">
-                    <rect className="model-chip-border-line" pathLength="100" />
-                    <rect className="model-chip-border-line model-chip-border-line-alt" pathLength="100" />
-                  </svg>
-                )}
-                <span className="model-chip-content">
-                  {getModelNameForBar(mid)}
-                  {isStreamingModel && (
-                    <span className="streaming-dot" style={{
-                      display: 'inline-block', width: 6, height: 6, borderRadius: '50%',
-                      background: streamingResponses?.[mid]?.status === 'done' ? 'var(--megaform-stone-600)' :
-                                streamingResponses?.[mid]?.status === 'error' ? '#ef4444' : 'var(--megaform-accent)',
-                      marginLeft: 4, animation: streamingResponses?.[mid]?.status === 'done' ? 'none' : 'pulse 1s infinite',
-                    }} />
-                  )}
-                  {!isStreamingModel && isOnDeepestPath && (
-                    <span className="deepest-path-dot" title={t('deepestPath')} />
-                  )}
-                </span>
-              </button>
-              {savedResponse && !isStreamingModel && (
                 <button
-                  type="button"
-                  className="model-chip-delete"
-                  title={t('deleteModelResponse')}
-                  aria-label={t('deleteModelResponseAria', { model: getModelNameForBar(mid) })}
-                  disabled={deletingResponseId === savedResponse.id}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    handleDeleteResponse(savedResponse);
-                  }}
+                  data-model-id={mid}
+                  className={`model-chip ${isActive ? 'active' : ''} ${isActivelyStreaming ? 'model-streaming' : ''} ${isDeleted ? 'deleted-model' : ''}`}
+                  onClick={() => setActiveModelId(nodeId, mid)}
+                  title={isDeleted ? t('deletedModelTitle') : undefined}
                 >
-                  <X size={11} strokeWidth={2.4} />
+                  {isActivelyStreaming && (
+                    <svg className="model-chip-border" aria-hidden="true" focusable="false">
+                      <rect className="model-chip-border-line" pathLength="100" />
+                      <rect className="model-chip-border-line model-chip-border-line-alt" pathLength="100" />
+                    </svg>
+                  )}
+                  <span className="model-chip-content">
+                    {getModelNameForBar(mid)}
+                    {isStreamingModel && (
+                      <span className="streaming-dot" style={{
+                        display: 'inline-block', width: 6, height: 6, borderRadius: '50%',
+                        background: streamingResponses?.[mid]?.status === 'done' ? 'var(--megaform-stone-600)' :
+                                  streamingResponses?.[mid]?.status === 'error' ? '#ef4444' : 'var(--megaform-accent)',
+                        marginLeft: 4, animation: streamingResponses?.[mid]?.status === 'done' ? 'none' : 'pulse 1s infinite',
+                      }} />
+                    )}
+                    {!isStreamingModel && isOnDeepestPath && (
+                      <span className="deepest-path-dot" title={t('deepestPath')} />
+                    )}
+                  </span>
                 </button>
-              )}
-            </span>
-          );
-        })}
+                {savedResponse && !isStreamingModel && (
+                  <button
+                    type="button"
+                    className="model-chip-delete"
+                    title={t('deleteModelResponse')}
+                    aria-label={t('deleteModelResponseAria', { model: getModelNameForBar(mid) })}
+                    disabled={deletingResponseId === savedResponse.id}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleDeleteResponse(savedResponse);
+                    }}
+                  >
+                    <X size={11} strokeWidth={2.4} />
+                  </button>
+                )}
+              </motion.span>
+            );
+          })}
+        </AnimatePresence>
 
         {/* ── 追加模型按钮 ── */}
         <div style={{ position: 'relative', display: 'inline-flex' }}>
@@ -1301,7 +1632,7 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                   <div className="followup-bottom-inner">
                     <div className="followup-input-popup followup-mobile-composer">
                       <div className="followup-input-label">
-                        {t('followupFor', { text: selectionInfo.text.slice(0, 30) })}
+                        <MarkdownContent content={t('followupFor', { text: getFollowupLabelPreview(selectionInfo.text) })} inline />
                       </div>
                       <textarea
                         value={followupInput}
@@ -1324,14 +1655,24 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                       />
                       <div className="followup-composer-toolbar">
                         <div className="followup-composer-tools">
-                          {visibleModels.map(m => {
+                          {followupVisibleModels.map(m => {
                             const isSelected = selectedModelIds.includes(m.id);
                             const thinkingLevels = getModelThinkingLevels(m);
                             const currentBudget = thinkingBudgets[m.id] || 0;
                             const hasThinking = thinkingLevels && thinkingLevels.length > 0;
 
                             return (
-                              <div key={m.id} className="followup-tool-wrap">
+                              <div
+                                key={m.id}
+                                className="followup-tool-wrap"
+                                ref={(element) => {
+                                  if (element) {
+                                    followupToolRefs.current.set(m.id, element);
+                                  } else {
+                                    followupToolRefs.current.delete(m.id);
+                                  }
+                                }}
+                              >
                                 <button
                                   className={`model-chip followup-tool-chip ${isSelected ? 'active' : ''}`}
                                   onClick={() => {
@@ -1346,8 +1687,25 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                                   {hasThinking && isSelected && currentBudget > 0 && (
                                     <span
                                       className={`thinking-indicator ${getThinkingDepthClass(thinkingLevels, currentBudget)}`}
+                                      onMouseDown={(e) => e.stopPropagation()}
+                                      onPointerDown={(e) => e.stopPropagation()}
+                                      onPointerUp={(e) => {
+                                        if (e.pointerType === 'mouse') return;
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        openFollowupThinkingPopoverFromTouch(m.id, e.currentTarget);
+                                      }}
+                                      onTouchEnd={(e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        openFollowupThinkingPopoverFromTouch(m.id, e.currentTarget);
+                                      }}
                                       onClick={(e) => {
                                         e.stopPropagation();
+                                        if (suppressNextFollowupThinkingClickRef.current) {
+                                          suppressNextFollowupThinkingClickRef.current = false;
+                                          return;
+                                        }
                                         toggleThinkingPopover(m.id, e.currentTarget);
                                       }}
                                       title={t('adjustThinkingDepth', { label: localizeThinkingLabel(thinkingLevels?.find(l => l.budget === currentBudget)?.label || String(currentBudget), language) })}
@@ -1358,8 +1716,25 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                                   {hasThinking && isSelected && currentBudget === 0 && (
                                     <span
                                       className="thinking-toggle-hint"
+                                      onMouseDown={(e) => e.stopPropagation()}
+                                      onPointerDown={(e) => e.stopPropagation()}
+                                      onPointerUp={(e) => {
+                                        if (e.pointerType === 'mouse') return;
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        openFollowupThinkingPopoverFromTouch(m.id, e.currentTarget);
+                                      }}
+                                      onTouchEnd={(e) => {
+                                        e.preventDefault();
+                                        e.stopPropagation();
+                                        openFollowupThinkingPopoverFromTouch(m.id, e.currentTarget);
+                                      }}
                                       onClick={(e) => {
                                         e.stopPropagation();
+                                        if (suppressNextFollowupThinkingClickRef.current) {
+                                          suppressNextFollowupThinkingClickRef.current = false;
+                                          return;
+                                        }
                                         toggleThinkingPopover(m.id, e.currentTarget);
                                       }}
                                       title={t('chooseThinkingDepth')}
@@ -1369,42 +1744,7 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                                   )}
                                 </button>
 
-                                {thinkingPopoverFor === m.id && hasThinking && (
-                                  <div
-                                    className={`thinking-popover${thinkingPopoverPosition ? ' mobile-fixed' : ''}`}
-                                    ref={popoverRef}
-                                    style={thinkingPopoverPosition ? {
-                                      left: thinkingPopoverPosition.left,
-                                      bottom: thinkingPopoverPosition.bottom,
-                                    } : undefined}
-                                  >
-                                    <div className="thinking-popover-title"><Activity size={14} style={{ verticalAlign: '-2px', marginRight: 4 }} /> {t('thinkingDepth')}</div>
-                                    {thinkingLevels!.map(level => (
-                                      <button
-                                        key={level.budget}
-                                        className={`thinking-level-btn ${currentBudget === level.budget ? 'active' : ''}`}
-                                        onClick={() => {
-                                          setThinkingBudget(m.id, level.budget);
-                                          setThinkingPopoverFor(null);
-                                          setThinkingPopoverPosition(null);
-                                        }}
-                                      >
-                                        <span className="thinking-level-label">{localizeThinkingLabel(level.label, language)}</span>
-                                        <span className="thinking-level-desc">{localizeThinkingDescription(level.description, language)}</span>
-                                      </button>
-                                    ))}
-                                    <button
-                                      className="thinking-level-btn"
-                                      onClick={() => {
-                                        setThinkingBudget(m.id, 0);
-                                        setThinkingPopoverFor(null);
-                                        setThinkingPopoverPosition(null);
-                                      }}
-                                    >
-                                      <X size={12} style={{ verticalAlign: '-2px', marginRight: 3 }} /> {t('disableThinking')}
-                                    </button>
-                                  </div>
-                                )}
+                                {thinkingPopoverFor === m.id && hasThinking && renderFollowupThinkingPopover(m.id, thinkingLevels!, currentBudget)}
                               </div>
                             );
                           })}
@@ -1423,7 +1763,6 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                           </button>
                           <button
                             onClick={submitFollowup}
-                            disabled={!followupInput.trim()}
                             className="followup-send-btn"
                             title={t('send')}
                           >
@@ -1474,7 +1813,7 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
           {showFollowupInput && (
             <div className="followup-input-popup followup-expand-enter">
               <div className="followup-input-label">
-                {t('followupFor', { text: selectionInfo.text.slice(0, 30) })}
+                <MarkdownContent content={t('followupFor', { text: getFollowupLabelPreview(selectionInfo.text) })} inline />
               </div>
               <textarea
                 value={followupInput}
@@ -1497,14 +1836,24 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
               />
               <div className="followup-composer-toolbar">
                 <div className="followup-composer-tools">
-                  {visibleModels.map(m => {
+                  {followupVisibleModels.map(m => {
                     const isSelected = selectedModelIds.includes(m.id);
                     const thinkingLevels = getModelThinkingLevels(m);
                     const currentBudget = thinkingBudgets[m.id] || 0;
                     const hasThinking = thinkingLevels && thinkingLevels.length > 0;
 
                     return (
-                      <div key={m.id} className="followup-tool-wrap">
+                      <div
+                        key={m.id}
+                        className="followup-tool-wrap"
+                        ref={(element) => {
+                          if (element) {
+                            followupToolRefs.current.set(m.id, element);
+                          } else {
+                            followupToolRefs.current.delete(m.id);
+                          }
+                        }}
+                      >
                         <button
                           className={`model-chip followup-tool-chip ${isSelected ? 'active' : ''}`}
                           onClick={() => {
@@ -1525,8 +1874,25 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                           {hasThinking && isSelected && currentBudget > 0 && (
                             <span
                               className={`thinking-indicator ${getThinkingDepthClass(thinkingLevels, currentBudget)}`}
+                              onMouseDown={(e) => e.stopPropagation()}
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onPointerUp={(e) => {
+                                if (e.pointerType === 'mouse') return;
+                                e.preventDefault();
+                                e.stopPropagation();
+                                openFollowupThinkingPopoverFromTouch(m.id, e.currentTarget);
+                              }}
+                              onTouchEnd={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                openFollowupThinkingPopoverFromTouch(m.id, e.currentTarget);
+                              }}
                               onClick={(e) => {
                                 e.stopPropagation();
+                                if (suppressNextFollowupThinkingClickRef.current) {
+                                  suppressNextFollowupThinkingClickRef.current = false;
+                                  return;
+                                }
                                 toggleThinkingPopover(m.id, e.currentTarget);
                               }}
                               title={t('adjustThinkingDepth', { label: localizeThinkingLabel(thinkingLevels?.find(l => l.budget === currentBudget)?.label || String(currentBudget), language) })}
@@ -1537,8 +1903,25 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                           {hasThinking && isSelected && currentBudget === 0 && (
                             <span
                               className="thinking-toggle-hint"
+                              onMouseDown={(e) => e.stopPropagation()}
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onPointerUp={(e) => {
+                                if (e.pointerType === 'mouse') return;
+                                e.preventDefault();
+                                e.stopPropagation();
+                                openFollowupThinkingPopoverFromTouch(m.id, e.currentTarget);
+                              }}
+                              onTouchEnd={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                openFollowupThinkingPopoverFromTouch(m.id, e.currentTarget);
+                              }}
                               onClick={(e) => {
                                 e.stopPropagation();
+                                if (suppressNextFollowupThinkingClickRef.current) {
+                                  suppressNextFollowupThinkingClickRef.current = false;
+                                  return;
+                                }
                                 toggleThinkingPopover(m.id, e.currentTarget);
                               }}
                               title={t('chooseThinkingDepth')}
@@ -1549,42 +1932,7 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                           )}
                         </button>
 
-                        {thinkingPopoverFor === m.id && hasThinking && (
-                          <div
-                            className={`thinking-popover${thinkingPopoverPosition ? ' mobile-fixed' : ''}`}
-                            ref={popoverRef}
-                            style={thinkingPopoverPosition ? {
-                              left: thinkingPopoverPosition.left,
-                              bottom: thinkingPopoverPosition.bottom,
-                            } : undefined}
-                          >
-                            <div className="thinking-popover-title"><Activity size={14} style={{ verticalAlign: '-2px', marginRight: 4 }} /> {t('thinkingDepth')}</div>
-                            {thinkingLevels!.map(level => (
-                              <button
-                                key={level.budget}
-                                className={`thinking-level-btn ${currentBudget === level.budget ? 'active' : ''}`}
-                                onClick={() => {
-                                  setThinkingBudget(m.id, level.budget);
-                                  setThinkingPopoverFor(null);
-                                  setThinkingPopoverPosition(null);
-                                }}
-                              >
-                                <span className="thinking-level-label">{localizeThinkingLabel(level.label, language)}</span>
-                                <span className="thinking-level-desc">{localizeThinkingDescription(level.description, language)}</span>
-                              </button>
-                            ))}
-                            <button
-                              className="thinking-level-btn"
-                              onClick={() => {
-                                setThinkingBudget(m.id, 0);
-                                setThinkingPopoverFor(null);
-                                setThinkingPopoverPosition(null);
-                              }}
-                            >
-                              <X size={12} style={{ verticalAlign: '-2px', marginRight: 3 }} /> {t('disableThinking')}
-                            </button>
-                          </div>
-                        )}
+                        {thinkingPopoverFor === m.id && hasThinking && renderFollowupThinkingPopover(m.id, thinkingLevels!, currentBudget)}
                       </div>
                     );
                   })}
@@ -1610,7 +1958,6 @@ export default function ResponseArea({ nodeId, responses, followupChildren, imme
                   </button>
                   <button
                     onClick={submitFollowup}
-                    disabled={!followupInput.trim()}
                     className="followup-send-btn"
                     title={t('send')}
                   >

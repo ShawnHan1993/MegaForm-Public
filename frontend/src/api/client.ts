@@ -2,7 +2,7 @@
  * MegaForm API Client
  */
 import type {
-  Root, Node, Response as Resp, Nut,
+  Root, RootGroup, Node, Response as Resp, Nut,
   ModelConfig, TokenUsage, TokenUsageResponse, ChatRequest, ChatResponse,
   UserProfile, UserProfileVersion,
   StreamCallbacks,
@@ -246,6 +246,252 @@ export async function chatStream(data: ChatRequest, callbacks: StreamCallbacks):
   }
 }
 
+export async function importPdfStream(
+  data: { file: File; rootId?: string | null; parentId?: string | null; relation?: 'followup' | 'progression'; cardContent?: string },
+  callbacks: StreamCallbacks
+): Promise<void> {
+  const params = new URLSearchParams();
+  params.set('filename', data.file.name);
+  if (data.rootId) params.set('root_id', data.rootId);
+  if (data.parentId) params.set('parent_id', data.parentId);
+  params.set('relation', data.relation || 'progression');
+  if (data.cardContent?.trim()) params.set('card_content', data.cardContent.trim());
+
+  const res = await fetch(`${BASE}/pdf/import/stream?${params.toString()}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/pdf',
+      'X-Filename': data.file.name,
+    },
+    credentials: 'same-origin',
+    body: data.file,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || res.statusText);
+  }
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() || '';
+
+      for (const part of parts) {
+        const parsedPart = parseSSEPart(part);
+        if (!parsedPart) continue;
+        const { eventType, eventData } = parsedPart;
+
+        let parsed: any;
+        try {
+          parsed = JSON.parse(eventData);
+        } catch {
+          continue;
+        }
+
+        switch (eventType) {
+          case 'node_created':
+            callbacks.onNodeCreated?.(parsed);
+            break;
+          case 'model_start':
+            callbacks.onModelStart?.(parsed);
+            break;
+          case 'thinking':
+            callbacks.onThinking?.(parsed);
+            break;
+          case 'content':
+            callbacks.onContent?.(parsed);
+            break;
+          case 'model_done':
+            callbacks.onModelDone?.(parsed);
+            break;
+          case 'model_error':
+            callbacks.onModelError?.(parsed);
+            break;
+          case 'done':
+            callbacks.onDone?.(parsed as SSEDone);
+            break;
+        }
+
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export async function importPdfUrlStream(
+  data: { url: string; filename?: string; rootId?: string | null; parentId?: string | null; relation?: 'followup' | 'progression'; cardContent?: string },
+  callbacks: StreamCallbacks
+): Promise<void> {
+  const res = await fetch(`${BASE}/pdf/import-url/stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      url: data.url,
+      filename: data.filename,
+      root_id: data.rootId,
+      parent_id: data.parentId,
+      relation: data.relation || 'progression',
+      card_content: data.cardContent,
+    }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || res.statusText);
+  }
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() || '';
+
+      for (const part of parts) {
+        const parsedPart = parseSSEPart(part);
+        if (!parsedPart) continue;
+        const { eventType, eventData } = parsedPart;
+
+        let parsed: any;
+        try {
+          parsed = JSON.parse(eventData);
+        } catch {
+          continue;
+        }
+
+        switch (eventType) {
+          case 'node_created':
+            callbacks.onNodeCreated?.(parsed);
+            break;
+          case 'model_start':
+            callbacks.onModelStart?.(parsed);
+            break;
+          case 'thinking':
+            callbacks.onThinking?.(parsed);
+            break;
+          case 'content':
+            callbacks.onContent?.(parsed);
+            break;
+          case 'model_done':
+            callbacks.onModelDone?.(parsed);
+            break;
+          case 'model_error':
+            callbacks.onModelError?.(parsed);
+            break;
+          case 'done':
+            callbacks.onDone?.(parsed as SSEDone);
+            break;
+        }
+
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+export async function importMarkdownStream(
+  data: { file: File; rootId?: string | null; parentId?: string | null; relation?: 'followup' | 'progression'; cardContent?: string },
+  callbacks: StreamCallbacks
+): Promise<void> {
+  const params = new URLSearchParams();
+  params.set('filename', data.file.name);
+  if (data.rootId) params.set('root_id', data.rootId);
+  if (data.parentId) params.set('parent_id', data.parentId);
+  params.set('relation', data.relation || 'progression');
+  if (data.cardContent?.trim()) params.set('card_content', data.cardContent.trim());
+
+  const res = await fetch(`${BASE}/markdown/import/stream?${params.toString()}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'text/markdown; charset=utf-8',
+      'X-Filename': data.file.name,
+    },
+    credentials: 'same-origin',
+    body: data.file,
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(err.error || res.statusText);
+  }
+
+  const reader = res.body!.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const parts = buffer.split('\n\n');
+      buffer = parts.pop() || '';
+
+      for (const part of parts) {
+        const parsedPart = parseSSEPart(part);
+        if (!parsedPart) continue;
+        const { eventType, eventData } = parsedPart;
+
+        let parsed: any;
+        try {
+          parsed = JSON.parse(eventData);
+        } catch {
+          continue;
+        }
+
+        switch (eventType) {
+          case 'node_created':
+            callbacks.onNodeCreated?.(parsed);
+            break;
+          case 'model_start':
+            callbacks.onModelStart?.(parsed);
+            break;
+          case 'thinking':
+            callbacks.onThinking?.(parsed);
+            break;
+          case 'content':
+            callbacks.onContent?.(parsed);
+            break;
+          case 'model_done':
+            callbacks.onModelDone?.(parsed);
+            break;
+          case 'model_error':
+            callbacks.onModelError?.(parsed);
+            break;
+          case 'done':
+            callbacks.onDone?.(parsed as SSEDone);
+            break;
+        }
+
+        await new Promise(r => setTimeout(r, 0));
+      }
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 /**
  * 重连流式聊天 — 当页面恢复/刷新时重新订阅正在进行的 LLM 输出。
  *
@@ -460,8 +706,25 @@ export const api = {
   logoutAll: () => request<{ status: string; revoked_sessions: number }>('/auth/logout-all', { method: 'POST' }),
 
   // Roots
-  /** 获取所有问题树根节点（按置顶/更新时间排序） */
+  /** 获取所有问题树根节点（按分组和组内顺序排序） */
   listRoots: () => request<Root[]>('/roots'),
+  /** 获取侧边栏分组 */
+  listRootGroups: () => request<RootGroup[]>('/root-groups'),
+  /** 新建侧边栏分组 */
+  createRootGroup: (data: { name: string }) =>
+    request<RootGroup>('/root-groups', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  /** 更新侧边栏分组 */
+  updateRootGroup: (id: string, data: Partial<RootGroup>) =>
+    request<RootGroup>(`/root-groups/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+  /** 删除侧边栏分组，组内问题树回到默认“对话” */
+  deleteRootGroup: (id: string) =>
+    request<{ status: string }>(`/root-groups/${id}`, { method: 'DELETE' }),
   /** 获取单个根节点详情 */
   getRoot: (id: string) => request<Root>(`/roots/${id}`),
   /** 更新根节点属性（摘要、置顶等） */
@@ -473,11 +736,11 @@ export const api = {
   /** 删除整棵问题树 */
   deleteRoot: (id: string) =>
     request<{ status: string }>(`/roots/${id}`, { method: 'DELETE' }),
-  /** 置顶/取消置顶问题树 */
-  pinRoot: (id: string, pinned: boolean) =>
-    request<{ status: string }>(`/roots/${id}/pin`, {
-      method: 'POST',
-      body: JSON.stringify({ pinned }),
+  /** 移动问题树到侧边栏分组，不改变对话更新时间 */
+  moveRootToGroup: (id: string, data: { group_id: string | null }) =>
+    request<Root>(`/roots/${id}/group`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
     }),
 
   // Root Tree
@@ -514,9 +777,10 @@ export const api = {
       body: JSON.stringify({ collapsed, summary }),
     }),
   /** 为节点生成 AI 摘要 */
-  generateSummary: (nodeId: string) =>
+  generateSummary: (nodeId: string, opts?: { force?: boolean }) =>
     request<{ summary: string; updated?: boolean; disabled?: boolean; skipped?: boolean }>(`/nodes/${nodeId}/generate-summary`, {
       method: 'POST',
+      body: opts ? JSON.stringify(opts) : undefined,
     }),
   /** 手动设置节点摘要 */
   updateSummary: (nodeId: string, summary: string) =>
@@ -571,14 +835,17 @@ export const api = {
     }),
 
   // Search
-  /** 全局搜索 */
-  search: (q: string) =>
-    request<any[]>(`/search?q=${encodeURIComponent(q)}`),
+  /** 全局搜索，可按侧边栏分组限定 */
+  search: (q: string, groupIds: string[] = []) => {
+    const params = new URLSearchParams({ q });
+    groupIds.forEach(groupId => params.append('group_id', groupId));
+    return request<any[]>(`/search?${params.toString()}`);
+  },
 
   // Models
   /** 获取所有模型配置列表及已选模型 */
   listModels: () =>
-    request<{ models: ModelConfig[]; selected_model_ids: string[]; summary_model_id: string; thinking_budgets: Record<string, number>; schema: any }>('/models'),
+    request<{ models: ModelConfig[]; selected_model_ids: string[]; summary_model_id: string; summary_auto_enabled: boolean; profile_update_model_id: string; thinking_budgets: Record<string, number>; schema: any }>('/models'),
   /** 创建或更新模型配置 */
   saveModel: (data: Partial<ModelConfig>) =>
     request<{ id: string; status: string }>('/models', {
@@ -619,7 +886,7 @@ export const api = {
   /** 获取当前用户全局 Profile Markdown */
   getProfile: () => request<UserProfile>('/profile'),
   /** 保存当前用户全局 Profile Markdown */
-  saveProfile: (data: { content: string; injection_enabled: boolean; note?: string }) =>
+  saveProfile: (data: { content: string; injection_enabled: boolean; profile_update_model_id?: string; note?: string }) =>
     request<UserProfile & { status: string }>('/profile', {
       method: 'POST',
       body: JSON.stringify(data),

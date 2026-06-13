@@ -36,6 +36,11 @@ interface Props {
   onCollapsedNutClick?: (nutId: string) => void;
   /** 是否处于流式输出状态（启用防抖减少闪跳） */
   streaming?: boolean;
+  /** 搜索命中词：渲染后包裹第一个匹配文本节点，供 ChatArea 精确滚动 */
+  searchQuery?: string;
+  searchHitId?: string;
+  /** 在标签、面包屑等短文本中以内联元素渲染 */
+  inline?: boolean;
 }
 
 // 配置 marked 支持 GFM
@@ -166,6 +171,9 @@ const MarkdownContent = memo(function MarkdownContent({
   pendingNutIds,
   onCollapsedNutClick,
   streaming = false,
+  searchQuery,
+  searchHitId,
+  inline = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -260,11 +268,13 @@ const MarkdownContent = memo(function MarkdownContent({
 
     try {
       const latexRendered = renderLatex(processedContent);
-      return marked.parse(latexRendered, { renderer: markdownRenderer }) as string;
+      return inline
+        ? marked.parseInline(latexRendered, { renderer: markdownRenderer }) as string
+        : marked.parse(latexRendered, { renderer: markdownRenderer }) as string;
     } catch {
-      return `<p>${processedContent}</p>`;
+      return inline ? processedContent : `<p>${processedContent}</p>`;
     }
-  }, [debouncedContent, contentOffset, highlightedNuts, hoveredNutId, collapsedNutIds, pendingNutIds]);
+  }, [debouncedContent, contentOffset, highlightedNuts, hoveredNutId, collapsedNutIds, pendingNutIds, inline]);
 
   // ── 代码块增强 ──
   // wrapper 由 marked renderer 直接生成；这里只负责 highlight.js 语法高亮。
@@ -298,6 +308,51 @@ const MarkdownContent = memo(function MarkdownContent({
       });
     });
   }, [html, content, streaming]);
+
+  // ── 搜索命中锚点：在渲染后的可见文本里包裹第一处匹配 ──
+  useEffect(() => {
+    const container = containerRef.current;
+    if (!container) return;
+
+    container.querySelectorAll('.search-hit-anchor').forEach((el) => {
+      const parent = el.parentNode;
+      if (!parent) return;
+      while (el.firstChild) parent.insertBefore(el.firstChild, el);
+      parent.removeChild(el);
+      parent.normalize();
+    });
+
+    const query = searchQuery?.trim();
+    if (!query || !searchHitId) return;
+
+    const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        if (!node.nodeValue?.trim()) return NodeFilter.FILTER_REJECT;
+        const parent = node.parentElement;
+        if (!parent) return NodeFilter.FILTER_REJECT;
+        if (parent.closest('script, style, button')) return NodeFilter.FILTER_REJECT;
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
+
+    const lowerQuery = query.toLocaleLowerCase();
+    let textNode = walker.nextNode() as Text | null;
+    while (textNode) {
+      const text = textNode.nodeValue || '';
+      const idx = text.toLocaleLowerCase().indexOf(lowerQuery);
+      if (idx >= 0) {
+        const range = document.createRange();
+        range.setStart(textNode, idx);
+        range.setEnd(textNode, idx + query.length);
+        const span = document.createElement('span');
+        span.className = 'search-hit-anchor';
+        span.dataset.searchHit = searchHitId;
+        range.surroundContents(span);
+        break;
+      }
+      textNode = walker.nextNode() as Text | null;
+    }
+  }, [html, searchQuery, searchHitId]);
 
   // ── 事件委托: 折叠 nut 点击 + 复制按钮点击 ──
   const handleClick = useCallback((e: React.MouseEvent) => {
@@ -346,10 +401,23 @@ const MarkdownContent = memo(function MarkdownContent({
 
   if (!content) return null;
 
+  const className = `markdown-body${streaming ? ' markdown-body-streaming' : ''}${inline ? ' markdown-inline' : ''}`;
+
+  if (inline) {
+    return (
+      <span
+        ref={containerRef}
+        className={className}
+        dangerouslySetInnerHTML={{ __html: html }}
+        onClick={handleClick}
+      />
+    );
+  }
+
   return (
     <div
       ref={containerRef}
-      className={`markdown-body${streaming ? ' markdown-body-streaming' : ''}`}
+      className={className}
       dangerouslySetInnerHTML={{ __html: html }}
       onClick={handleClick}
     />
@@ -359,6 +427,9 @@ const MarkdownContent = memo(function MarkdownContent({
     && prevProps.contentOffset === nextProps.contentOffset
     && prevProps.hoveredNutId === nextProps.hoveredNutId
     && prevProps.streaming === nextProps.streaming
+    && prevProps.searchQuery === nextProps.searchQuery
+    && prevProps.searchHitId === nextProps.searchHitId
+    && prevProps.inline === nextProps.inline
     && nutsEqual(prevProps.highlightedNuts, nextProps.highlightedNuts)
     && setEquals(prevProps.collapsedNutIds, nextProps.collapsedNutIds)
     && setEquals(prevProps.pendingNutIds, nextProps.pendingNutIds);

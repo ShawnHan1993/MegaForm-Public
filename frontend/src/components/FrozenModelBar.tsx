@@ -3,11 +3,11 @@
  * 
  * 当用户滚动聊天区域、节点的原始模型 tab 栏滚出视口时，
  * 该节点的模型 tabs 会「冻结」在面包屑导航下方。
- * 支持多个节点堆叠，追问节点独立堆叠，推演节点替换父节点。
+ * 冻结状态在 ChatArea 中以栈维护，本组件只渲染传入的栈顶条目。
  * 
  * FLIP 动画：新冻结行的芯片从原 model-bar 位置平滑飞入。
  */
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
 import { useAppStore } from '../store/appStore';
 import { useT } from '../i18n';
 
@@ -17,7 +17,7 @@ export interface FrozenEntry {
   question: string;
   /** 该节点的回答模型 ID 列表 */
   modelIds: string[];
-  /** 与父节点的关系：追问=独立堆叠，推演=替换父行 */
+  /** 与父节点的关系，用于保留冻结条来源语义 */
   relation: 'followup' | 'progression';
 }
 
@@ -32,24 +32,30 @@ interface Props {
   flipCapturesRef?: React.MutableRefObject<FlipCaptures>;
   /** 面包屑导航高度，用于向下偏移冻结栏（悬浮布局时） */
   top?: number;
+  /** 移动端跟随面包屑自动显隐 */
+  visible?: boolean;
 }
 
 const FLIP_DURATION = '0.28s';
 const FLIP_EASING = 'cubic-bezier(0.16, 1, 0.3, 1)';
 
-export default function FrozenModelBar({ entries, onSelectModel, flipCapturesRef, top }: Props) {
+export default function FrozenModelBar({ entries, onSelectModel, flipCapturesRef, top, visible = true }: Props) {
   const t = useT();
   const models = useAppStore(s => s.models);
   const activeModelId = useAppStore(s => s.activeModelId);
   const setActiveModelId = useAppStore(s => s.setActiveModelId);
   const focusNode = useAppStore(s => s.focusNode);
+  const visibleEntries = useMemo(
+    () => entries.length > 0 ? [entries[entries.length - 1]] : [],
+    [entries]
+  );
 
   // ── FLIP 动画：新冻结行从原始 model-bar 位置飞入 ──
   useEffect(() => {
     const captures = flipCapturesRef?.current;
     if (!captures || Object.keys(captures).length === 0) return;
 
-    for (const entry of entries) {
+    for (const entry of visibleEntries) {
       const nodeId = entry.nodeId;
       const chipCaptures = captures[nodeId];
       if (!chipCaptures) continue;
@@ -90,7 +96,7 @@ export default function FrozenModelBar({ entries, onSelectModel, flipCapturesRef
       // 消费捕获（下次重新冻结时会重新捕获 → 再次触发动画）
       delete captures[nodeId];
     }
-  }, [entries, flipCapturesRef]);
+  }, [visibleEntries, flipCapturesRef]);
 
   const getModelName = (mid: string) => models.find(m => m.id === mid)?.name || mid;
   const isDeletedModel = (mid: string) => models.find(m => m.id === mid)?.deleted === 1;
@@ -101,9 +107,12 @@ export default function FrozenModelBar({ entries, onSelectModel, flipCapturesRef
   };
 
   return (
-    <div className={`frozen-bar-shell${entries.length > 0 ? ' has-entries' : ''}`} style={top != null ? { top } : undefined}>
+    <div
+      className={`frozen-bar-shell${entries.length > 0 ? ' has-entries' : ''}${visible ? '' : ' hidden'}`}
+      style={top != null ? { top } : undefined}
+    >
       <div className="frozen-model-bar">
-        {entries.map((entry) => {
+        {visibleEntries.map((entry) => {
           const sortedModelIds = [...entry.modelIds].sort((a, b) => {
             const aDeleted = isDeletedModel(a);
             const bDeleted = isDeletedModel(b);

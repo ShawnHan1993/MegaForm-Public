@@ -2,9 +2,10 @@
  * MegaForm 全局状态 Store (Zustand)
  */
 import { create } from 'zustand';
-import { api, chatStream, reconnectChatStream, rerunNodeStream, streamRootTree, addModelStream } from '../api/client';
-import type { Root, Node, Response as Resp, ModelConfig, StreamingResponse, Nut } from '../types';
+import { api, chatStream, reconnectChatStream, rerunNodeStream, streamRootTree, addModelStream, importPdfStream, importPdfUrlStream, importMarkdownStream } from '../api/client';
+import type { Root, RootGroup, Node, Response as Resp, ModelConfig, StreamingResponse, Nut } from '../types';
 import { getLanguage, tr } from '../i18n';
+import type { ImageAttachment } from '../utils/multimodal';
 
 // ── localStorage 持久化：折叠状态 ──
 const LS_COLLAPSED_PREFIX = 'megaform-collapsed-';
@@ -190,6 +191,16 @@ function mergeResponsesByModel(existing: any[] | undefined, incoming: any[]): an
   return merged;
 }
 
+async function loadNodeResponsesOrFallback(nodeId: string, fallback: any[], logLabel: string): Promise<any[]> {
+  try {
+    const responses = await api.getNodeResponses(nodeId);
+    return responses.length > 0 ? responses : fallback;
+  } catch (e) {
+    console.error(`[${logLabel}] getNodeResponses failed:`, e);
+    return fallback;
+  }
+}
+
 /**
  * 将刚自动创建的追问 Nut 热补丁到父节点对应 response.nuts。
  *
@@ -257,10 +268,22 @@ function patchNodeSummaryInTree(nodes: Node[], nodeId: string, summary: string):
   return false;
 }
 
+function patchRootSummary(roots: Root[], nodeId: string, summary: string): { roots: Root[]; patched: boolean } {
+  let patched = false;
+  const nextRoots = roots.map(root => {
+    if (root.id !== nodeId) return root;
+    patched = true;
+    return { ...root, summary };
+  });
+  return { roots: nextRoots, patched };
+}
+
 export interface AppState {
   // ── 问题 ──
   /** 问题树列表（按更新时间倒序排列） */
   roots: Root[];
+  /** 侧边栏自定义分组 */
+  rootGroups: RootGroup[];
   /** 当前打开的问题树 ID（null 表示未打开任何问题） */
   currentRootId: string | null;
   /** 当前问题树的树形结构（null 表示未加载） */
@@ -275,8 +298,10 @@ export interface AppState {
   models: ModelConfig[];
   /** 用户已选择用于回答的模型 ID 列表（多选） */
   selectedModelIds: string[];
-  /** 自动摘要使用的模型 ID；空字符串表示关闭 */
+  /** 摘要使用的模型 ID；空字符串表示未选择 */
   summaryModelId: string;
+  /** 是否自动为长问题和问题树生成摘要 */
+  summaryAutoEnabled: boolean;
 
   // ── 视图状态 ──
   /** 每个节点的当前活跃模型 ID，nodeId → modelId */
@@ -291,6 +316,8 @@ export interface AppState {
   webSearchEnabled: boolean;
   /** 是否把用户全局 Profile 注入模型上下文 */
   profileInjectionEnabled: boolean;
+  /** MinerU API Key 是否已配置（仅用于控制 PDF 上传入口状态） */
+  mineruApiKeyConfigured: boolean;
 
   // ── 加载状态 ──
   /** 全局加载状态（打开问题树等） */
@@ -320,6 +347,14 @@ export interface AppState {
 
   /** 推演子节点创建后需要滚动到的节点 ID（不切换聚焦，仅滚动） */
   scrollToNodeId: string | null;
+  /** 搜索结果定位目标：用于打开节点后滚动到命中词在原文中的位置 */
+  searchScrollTarget: {
+    nodeId: string;
+    query: string;
+    type: 'node' | 'response';
+    modelId?: string;
+    requestId: number;
+  } | null;
 
   // ── UI 触发器 ──
   /** 递增以触发 InputBar 组件自动聚焦（每次 setState +1 触发 effect） */
@@ -328,15 +363,23 @@ export interface AppState {
   // ── Actions ──
   /** 获取问题树列表 */
   fetchRoots: () => Promise<void>;
+  /** 新建侧边栏分组 */
+  createRootGroup: (name: string) => Promise<void>;
+  /** 更新侧边栏分组 */
+  updateRootGroup: (groupId: string, data: Partial<RootGroup>) => Promise<void>;
+  /** 删除侧边栏分组，组内问题树回到“对话” */
+  deleteRootGroup: (groupId: string) => Promise<void>;
+  /** 移动 root 到分组，不改变对话更新时间 */
+  moveRootToGroup: (rootId: string, groupId: string | null) => Promise<void>;
   /** 清除 scrollToNodeId（滚动完成后由 ChatArea 调用） */
   clearScrollToNodeId: () => void;
+  /** 设置/清除搜索结果定位目标 */
+  setSearchScrollTarget: (target: Omit<NonNullable<AppState['searchScrollTarget']>, 'requestId'> | null) => void;
+  clearSearchScrollTarget: () => void;
   /** 打开问题树（SSE 流式加载树，5 秒超时回退到 REST API） */
   openRoot: (rootId: string) => Promise<void>;
   /** 删除问题树（从列表移除；若当前问题树被删则回到 empty-state） */
   deleteRoot: (rootId: string) => Promise<void>;
-  /** 置顶/取消置顶问题树 */
-  pinRoot: (rootId: string, pinned: boolean) => Promise<void>;
-
   /** 聚焦节点（设置 focusedNodeId） */
   focusNode: (nodeId: string) => void;
   /** 切换节点折叠/展开 */
@@ -370,6 +413,32 @@ export interface AppState {
     parentModelId?: string;
     modelIds?: string[];
     relation?: 'followup' | 'progression';
+    attachments?: ImageAttachment[];
+  }) => Promise<void>;
+
+  /** 上传 PDF 并通过 MinerU 转成 Markdown response */
+  importPdf: (file: File, opts: {
+    rootId?: string;
+    parentId?: string;
+    relation?: 'followup' | 'progression';
+    cardContent?: string;
+  }) => Promise<void>;
+
+  /** 直接提交 PDF 链接给 MinerU 并渲染 Markdown response */
+  importPdfUrl: (url: string, opts: {
+    filename?: string;
+    rootId?: string;
+    parentId?: string;
+    relation?: 'followup' | 'progression';
+    cardContent?: string;
+  }) => Promise<void>;
+
+  /** 上传 Markdown 文件并作为 Markdown response 渲染 */
+  importMarkdown: (file: File, opts: {
+    rootId?: string;
+    parentId?: string;
+    relation?: 'followup' | 'progression';
+    cardContent?: string;
   }) => Promise<void>;
 
   /** 为指定节点向指定模型请求新响应（非流式，完成后刷新树） */
@@ -388,8 +457,10 @@ export interface AppState {
   fetchModels: () => Promise<void>;
   /** 设置已选模型 ID 列表 */
   setSelectedModelIds: (ids: string[]) => void;
-  /** 设置自动摘要模型；空字符串表示关闭 */
+  /** 设置摘要模型；空字符串表示未选择 */
   setSummaryModelId: (id: string) => void;
+  /** 切换是否自动生成摘要（手动生成不受影响） */
+  setSummaryAutoEnabled: (enabled: boolean) => void;
   /** 设置某节点的活跃模型 tab */
   setActiveModelId: (nodeId: string, modelId: string) => void;
   /** 设置某个模型的深度思考预算值 */
@@ -408,7 +479,7 @@ export interface AppState {
   /** 删除某个节点上的单条模型回复 */
   deleteResponse: (nodeId: string, responseId: string, modelId: string) => Promise<void>;
   /** 使用后端配置的摘要模型为节点生成摘要，并补丁到当前树 */
-  generateNodeSummary: (nodeId: string) => Promise<void>;
+  generateNodeSummary: (nodeId: string, opts?: { force?: boolean }) => Promise<void>;
 
   // ── Helpers ──
   /** 从 rootTree 中查找节点从根到自身的路径链 */
@@ -449,18 +520,21 @@ export interface AppState {
 export const useAppStore = create<AppState>((set, get) => ({
   // ── 初始状态 ──
   roots: [],
+  rootGroups: [],
   currentRootId: null,
   rootTree: null,
   focusedNodeId: null,
   models: [],
   selectedModelIds: [],
   summaryModelId: '',
+  summaryAutoEnabled: false,
   activeModelId: {},
   collapsedSet: new Set(),
   immersiveHiddenSet: new Set(),
   thinkingBudgets: {},
   webSearchEnabled: false,
   profileInjectionEnabled: true,
+  mineruApiKeyConfigured: false,
   loading: false,
   treeLoading: false,
   sendingMessage: false,
@@ -472,15 +546,53 @@ export const useAppStore = create<AppState>((set, get) => ({
   streamingRelation: {},
   nodeCache: {},
   scrollToNodeId: null,
+  searchScrollTarget: null,
   inputFocusTrigger: 0,
 
   /** 获取问题树列表，替换全局 roots */
   fetchRoots: async () => {
+    const [roots, rootGroups] = await Promise.all([
+      api.listRoots(),
+      api.listRootGroups(),
+    ]);
+    set({ roots, rootGroups });
+  },
+
+  createRootGroup: async (name: string) => {
+    await api.createRootGroup({ name });
+    const rootGroups = await api.listRootGroups();
+    set({ rootGroups });
+  },
+
+  updateRootGroup: async (groupId: string, data: Partial<RootGroup>) => {
+    const group = await api.updateRootGroup(groupId, data);
+    set(state => ({
+      rootGroups: state.rootGroups.map(g => g.id === groupId ? group : g),
+    }));
+  },
+
+  deleteRootGroup: async (groupId: string) => {
+    await api.deleteRootGroup(groupId);
+    const [roots, rootGroups] = await Promise.all([
+      api.listRoots(),
+      api.listRootGroups(),
+    ]);
+    set({ roots, rootGroups });
+  },
+
+  moveRootToGroup: async (rootId: string, groupId: string | null) => {
+    await api.moveRootToGroup(rootId, {
+      group_id: groupId,
+    });
     const roots = await api.listRoots();
     set({ roots });
   },
 
   clearScrollToNodeId: () => set({ scrollToNodeId: null }),
+  setSearchScrollTarget: (target) => set({
+    searchScrollTarget: target ? { ...target, requestId: Date.now() } : null,
+  }),
+  clearSearchScrollTarget: () => set({ searchScrollTarget: null }),
 
   /**
    * 打开问题树，实现 SSE 流式加载 + 5 秒超时 REST 回退
@@ -613,16 +725,14 @@ export const useAppStore = create<AppState>((set, get) => ({
     }));
   },
 
-  /** 置顶/取消置顶 */
-  pinRoot: async (rootId: string, pinned: boolean) => {
-    await api.pinRoot(rootId, pinned);
-    const roots = await api.listRoots();
-    set({ roots });
-  },
-
   /** 设置聚焦节点 */
   focusNode: (nodeId: string) => {
-    set({ focusedNodeId: nodeId });
+    set(state => {
+      const collapsedSet = new Set(state.collapsedSet);
+      collapsedSet.delete(nodeId);
+      saveCollapsedSet(state.currentRootId, collapsedSet);
+      return { focusedNodeId: nodeId, collapsedSet };
+    });
   },
 
   /** 切换节点折叠/展开 */
@@ -708,6 +818,8 @@ export const useAppStore = create<AppState>((set, get) => ({
     const useProfile = opts.useProfile !== undefined ? opts.useProfile : profileInjectionEnabled;
     const requestedModelIds = opts.modelIds ?? selectedModelIds;
     const isLogicNode = requestedModelIds.length === 0;
+    const nodeAttachments = opts.attachments || [];
+    const nodeAttachmentsJson = JSON.stringify(nodeAttachments);
 
     const parentModelId = opts.parentId
       ? (opts.parentModelId || undefined)
@@ -746,6 +858,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         parent_model_id: parentModelId,
         relation: opts.relation,
         thinking_budgets: Object.keys(nonZeroBudgets).length > 0 ? nonZeroBudgets : undefined,
+        attachments: opts.attachments,
       }, {
         onNodeCreated: (data) => {
           const nodeId = data.node_id;
@@ -771,7 +884,7 @@ export const useAppStore = create<AppState>((set, get) => ({
                         nut_id: data.nut_id || null,
                         parent_model_id: parentModelId || null,
                         search_enabled: null,
-                        attachments: '[]',
+                        attachments: nodeAttachmentsJson,
                         summary: '',
                         pinned: 0,
                         archived: 0,
@@ -824,7 +937,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             };
           });
 
-          if (estimateTextTokens(content) > 30) {
+          if (get().summaryAutoEnabled && estimateTextTokens(content) > 30) {
             get().generateNodeSummary(nodeId).catch(e => {
               console.error('[summary] generate node summary failed:', e);
             });
@@ -980,7 +1093,7 @@ export const useAppStore = create<AppState>((set, get) => ({
                           nut_id: nutId,
                           parent_model_id: parentModelId || null,
                           search_enabled: null,
-                          attachments: '[]',
+                          attachments: nodeAttachmentsJson,
                           summary: '',
                           pinned: 0,
                           archived: 0,
@@ -1023,7 +1136,7 @@ export const useAppStore = create<AppState>((set, get) => ({
                     nut_id: null,
                     parent_model_id: null,
                     search_enabled: null,
-                    attachments: '[]',
+                    attachments: nodeAttachmentsJson,
                     summary: '',
                     pinned: 0,
                     archived: 0,
@@ -1113,6 +1226,899 @@ export const useAppStore = create<AppState>((set, get) => ({
           streamingNodeIds: newSids,
           streamingContent: contentMap,
           streamingResponses: state.streamingResponses,
+          streamingNutId: nutMap,
+          streamingRelation: relMap,
+        };
+      });
+      throw e;
+    }
+  },
+
+  importPdf: async (file, opts) => {
+    const rootId = opts.rootId || get().currentRootId;
+    const defaultContent = getLanguage() === 'en' ? `Read PDF: ${file.name}` : `阅读 PDF：${file.name}`;
+    const content = opts.cardContent?.trim() || defaultContent;
+    const modelId = 'mineru-pdf';
+    const pendingNodeId = `pending-pdf-${Date.now()}`;
+    const switchFocus = !opts.parentId;
+
+    set(state => ({
+      sendingMessage: true,
+      streamingNodeIds: new Set([...state.streamingNodeIds, pendingNodeId]),
+      streamingContent: { ...state.streamingContent, [pendingNodeId]: content },
+      streamingNutId: { ...state.streamingNutId, [pendingNodeId]: null },
+      streamingRelation: { ...state.streamingRelation, [pendingNodeId]: opts.relation || 'progression' },
+      focusedNodeId: switchFocus ? pendingNodeId : (opts.parentId || pendingNodeId),
+    }));
+
+    let realNodeId = pendingNodeId;
+    let realRootId = rootId || '';
+
+    try {
+      await importPdfStream({
+        file,
+        rootId: rootId || undefined,
+        parentId: opts.parentId,
+        relation: opts.relation || 'progression',
+        cardContent: content,
+      }, {
+        onNodeCreated: (data) => {
+          realNodeId = data.node_id;
+          realRootId = data.root_id;
+          set(prev => {
+            const tree = prev.rootTree ? JSON.parse(JSON.stringify(prev.rootTree)) : [];
+            const relation = opts.relation || 'progression';
+
+            if (opts.parentId) {
+              const findAndAddChild = (nodes: any[]): boolean => {
+                for (const n of nodes) {
+                  if (n.id === opts.parentId) {
+                    if (!n.children) n.children = [];
+                    if (!n.children.some((c: any) => c.id === realNodeId)) {
+                      n.children.push({
+                        id: realNodeId,
+                        root_id: realRootId,
+                        parent_id: opts.parentId,
+                        child_order: n.children.length,
+                        content,
+                        relation,
+                        nut_id: null,
+                        parent_model_id: modelId,
+                        search_enabled: null,
+                        attachments: '[]',
+                        summary: '',
+                        pinned: 0,
+                        archived: 0,
+                        meta: JSON.stringify({ kind: 'pdf_import', filename: file.name, source: 'mineru' }),
+                        created_at: new Date().toISOString(),
+                        updated_at: new Date().toISOString(),
+                        responses: [],
+                        children: [],
+                      });
+                    }
+                    return true;
+                  }
+                  if (n.children?.length && findAndAddChild(n.children)) return true;
+                }
+                return false;
+              };
+              findAndAddChild(tree);
+            }
+
+            if (typeof window !== 'undefined' && switchFocus) {
+              window.history.pushState(null, '', '/node/' + realNodeId);
+            }
+
+            const newSids = new Set(prev.streamingNodeIds);
+            newSids.delete(pendingNodeId);
+            newSids.add(realNodeId);
+
+            const contentMap = { ...prev.streamingContent };
+            delete contentMap[pendingNodeId];
+            contentMap[realNodeId] = content;
+
+            const nutMap = { ...prev.streamingNutId };
+            delete nutMap[pendingNodeId];
+            nutMap[realNodeId] = null;
+
+            const relMap = { ...prev.streamingRelation };
+            delete relMap[pendingNodeId];
+            relMap[realNodeId] = relation;
+
+            return {
+              streamingNodeIds: newSids,
+              streamingContent: contentMap,
+              streamingNutId: nutMap,
+              streamingRelation: relMap,
+              focusedNodeId: switchFocus ? realNodeId : (opts.parentId || realNodeId),
+              scrollToNodeId: switchFocus ? null : realNodeId,
+              currentRootId: realRootId || prev.currentRootId,
+              rootTree: tree.length ? tree : prev.rootTree,
+            };
+          });
+        },
+        onModelStart: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => ({
+            streamingResponses: {
+              ...state.streamingResponses,
+              [key]: { thinking: '', content: '', status: 'thinking', model_name: data.model_name },
+            },
+          }));
+        },
+        onThinking: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => {
+            const resp = state.streamingResponses[key];
+            if (!resp) return state;
+            return {
+              streamingResponses: {
+                ...state.streamingResponses,
+                [key]: { ...resp, thinking: resp.thinking + data.content, status: 'thinking' },
+              },
+            };
+          });
+        },
+        onContent: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => {
+            const resp = state.streamingResponses[key];
+            if (!resp) return state;
+            return {
+              streamingResponses: {
+                ...state.streamingResponses,
+                [key]: { ...resp, content: resp.content + data.content, status: 'responding' },
+              },
+            };
+          });
+        },
+        onModelDone: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => {
+            const resp = state.streamingResponses[key];
+            if (!resp) return state;
+            return {
+              streamingResponses: {
+                ...state.streamingResponses,
+                [key]: {
+                  ...resp,
+                  status: 'done',
+                  response_id: data.response_id,
+                  tokens_input: data.tokens_input || 0,
+                  tokens_output: data.tokens_output || 0,
+                  cost: data.cost || 0,
+                  latency_ms: data.latency_ms,
+                },
+              },
+            };
+          });
+        },
+        onModelError: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => ({
+            streamingResponses: {
+              ...state.streamingResponses,
+              [key]: { thinking: '', content: '', status: 'error', error: data.error, model_name: data.model_name },
+            },
+            error: `${data.model_name || data.model_id}: ${data.error}`,
+          }));
+        },
+        onDone: async () => {
+          const state = get();
+          const key = srKey(realNodeId, modelId);
+          const sr = state.streamingResponses[key];
+          const fallbackResponses = sr ? [{
+            id: (sr as any).response_id || `stream-${modelId}`,
+            node_id: realNodeId,
+            model_id: modelId,
+            content: sr.content,
+            status: sr.status === 'error' ? 'error' : 'completed',
+            tokens_input: (sr as any).tokens_input || 0,
+            tokens_output: (sr as any).tokens_output || 0,
+            latency_ms: (sr as any).latency_ms || null,
+            finish_reason: sr.status === 'error' ? 'error' : 'stop',
+            sources: '[]',
+            meta: sr.thinking ? JSON.stringify({ thinking_content: sr.thinking, source: 'mineru', filename: file.name }) : JSON.stringify({ source: 'mineru', filename: file.name }),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            nuts: [],
+            model_name: sr.model_name || 'MinerU PDF',
+          }] : [];
+          const newResponses = await loadNodeResponsesOrFallback(realNodeId, fallbackResponses, 'pdf-import');
+
+          set(prev => {
+            const tree = prev.rootTree ? JSON.parse(JSON.stringify(prev.rootTree)) : [];
+            const relation = prev.streamingRelation[realNodeId] || opts.relation || 'progression';
+
+            if (opts.parentId) {
+              const patchChild = (nodes: any[]): boolean => {
+                for (const n of nodes) {
+                  if (n.id === opts.parentId) {
+                    const existing = n.children?.find((c: any) => c.id === realNodeId);
+                    if (existing && newResponses.length > 0) {
+                      existing.responses = mergeResponsesByModel(existing.responses, newResponses);
+                    }
+                    return true;
+                  }
+                  if (n.children?.length && patchChild(n.children)) return true;
+                }
+                return false;
+              };
+              patchChild(tree);
+            } else {
+              const existingRoot = tree.find((n: any) => n.id === realNodeId);
+              if (existingRoot) {
+                existingRoot.responses = mergeResponsesByModel(existingRoot.responses, newResponses);
+              } else {
+                tree.push({
+                  id: realNodeId,
+                  root_id: realRootId,
+                  parent_id: null,
+                  child_order: 0,
+                  content,
+                  relation,
+                  nut_id: null,
+                  parent_model_id: null,
+                  search_enabled: null,
+                  attachments: '[]',
+                  summary: '',
+                  pinned: 0,
+                  archived: 0,
+                  meta: JSON.stringify({ kind: 'pdf_import', filename: file.name, source: 'mineru' }),
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                  responses: newResponses,
+                  children: [],
+                });
+              }
+            }
+
+            const newSids = new Set(prev.streamingNodeIds);
+            newSids.delete(realNodeId);
+            const contentMap = { ...prev.streamingContent };
+            const nutMap = { ...prev.streamingNutId };
+            const relMap = { ...prev.streamingRelation };
+            delete contentMap[realNodeId];
+            delete nutMap[realNodeId];
+            delete relMap[realNodeId];
+
+            return {
+              rootTree: tree,
+              sendingMessage: false,
+              streamingNodeIds: newSids,
+              streamingContent: contentMap,
+              streamingResponses: removeStreamingResponseKeys(prev.streamingResponses, realNodeId, [modelId]),
+              streamingNutId: nutMap,
+              streamingRelation: relMap,
+              scrollToNodeId: null,
+            };
+          });
+
+          try { await get().fetchRoots(); } catch (e) { console.error('[pdf-import] fetchRoots failed:', e); }
+        },
+      });
+    } catch (e: any) {
+      console.error('importPdf error:', e);
+      let msg = e?.message || String(e);
+      if (msg === 'Failed to fetch') msg = tr('serverOffline', undefined, getLanguage());
+      set(state => {
+        const newSids = new Set(state.streamingNodeIds);
+        newSids.delete(pendingNodeId);
+        newSids.delete(realNodeId);
+        const contentMap = { ...state.streamingContent };
+        const nutMap = { ...state.streamingNutId };
+        const relMap = { ...state.streamingRelation };
+        delete contentMap[pendingNodeId];
+        delete contentMap[realNodeId];
+        delete nutMap[pendingNodeId];
+        delete nutMap[realNodeId];
+        delete relMap[pendingNodeId];
+        delete relMap[realNodeId];
+        return {
+          error: msg,
+          sendingMessage: false,
+          streamingNodeIds: newSids,
+          streamingContent: contentMap,
+          streamingResponses: removeNodeStreamingResponses(state.streamingResponses, realNodeId),
+          streamingNutId: nutMap,
+          streamingRelation: relMap,
+        };
+      });
+      throw e;
+    }
+  },
+
+  importPdfUrl: async (url, opts) => {
+    const rootId = opts.rootId || get().currentRootId;
+    let filename = (opts.filename || '').trim();
+    if (!filename) {
+      try {
+        const parsed = new URL(url);
+        filename = decodeURIComponent(parsed.pathname.split('/').filter(Boolean).pop() || 'document.pdf');
+      } catch {
+        filename = 'document.pdf';
+      }
+    }
+    if (!filename.toLowerCase().endsWith('.pdf')) filename = `${filename}.pdf`;
+    const defaultContent = getLanguage() === 'en' ? `Read PDF: ${filename}` : `阅读 PDF：${filename}`;
+    const content = opts.cardContent?.trim() || defaultContent;
+    const modelId = 'mineru-pdf';
+    const pendingNodeId = `pending-pdf-url-${Date.now()}`;
+    const switchFocus = !opts.parentId;
+
+    set(state => ({
+      sendingMessage: true,
+      streamingNodeIds: new Set([...state.streamingNodeIds, pendingNodeId]),
+      streamingContent: { ...state.streamingContent, [pendingNodeId]: content },
+      streamingNutId: { ...state.streamingNutId, [pendingNodeId]: null },
+      streamingRelation: { ...state.streamingRelation, [pendingNodeId]: opts.relation || 'progression' },
+      focusedNodeId: switchFocus ? pendingNodeId : (opts.parentId || pendingNodeId),
+    }));
+
+    let realNodeId = pendingNodeId;
+    let realRootId = rootId || '';
+
+    try {
+      await importPdfUrlStream({
+        url,
+        filename,
+        rootId: rootId || undefined,
+        parentId: opts.parentId,
+        relation: opts.relation || 'progression',
+        cardContent: content,
+      }, {
+        onNodeCreated: (data) => {
+          realNodeId = data.node_id;
+          realRootId = data.root_id;
+          set(prev => {
+            const tree = prev.rootTree ? JSON.parse(JSON.stringify(prev.rootTree)) : [];
+            const relation = opts.relation || 'progression';
+
+            if (opts.parentId) {
+              const findAndAddChild = (nodes: any[]): boolean => {
+                for (const n of nodes) {
+                  if (n.id === opts.parentId) {
+                    if (!n.children) n.children = [];
+                    if (!n.children.some((c: any) => c.id === realNodeId)) {
+                      n.children.push({
+                        id: realNodeId,
+                        root_id: realRootId,
+                        parent_id: opts.parentId,
+                        child_order: n.children.length,
+                        content,
+                        relation,
+                        nut_id: null,
+                        parent_model_id: modelId,
+                        search_enabled: null,
+                        attachments: '[]',
+                        summary: '',
+                        pinned: 0,
+                        archived: 0,
+                        meta: JSON.stringify({ kind: 'pdf_import', filename, source: 'mineru_url', source_url: url }),
+                        created_at: new Date().toISOString(),
+                        updated_at: new Date().toISOString(),
+                        responses: [],
+                        children: [],
+                      });
+                    }
+                    return true;
+                  }
+                  if (n.children?.length && findAndAddChild(n.children)) return true;
+                }
+                return false;
+              };
+              findAndAddChild(tree);
+            }
+
+            if (typeof window !== 'undefined' && switchFocus) {
+              window.history.pushState(null, '', '/node/' + realNodeId);
+            }
+
+            const newSids = new Set(prev.streamingNodeIds);
+            newSids.delete(pendingNodeId);
+            newSids.add(realNodeId);
+
+            const contentMap = { ...prev.streamingContent };
+            delete contentMap[pendingNodeId];
+            contentMap[realNodeId] = content;
+
+            const nutMap = { ...prev.streamingNutId };
+            delete nutMap[pendingNodeId];
+            nutMap[realNodeId] = null;
+
+            const relMap = { ...prev.streamingRelation };
+            delete relMap[pendingNodeId];
+            relMap[realNodeId] = relation;
+
+            return {
+              streamingNodeIds: newSids,
+              streamingContent: contentMap,
+              streamingNutId: nutMap,
+              streamingRelation: relMap,
+              focusedNodeId: switchFocus ? realNodeId : (opts.parentId || realNodeId),
+              scrollToNodeId: switchFocus ? null : realNodeId,
+              currentRootId: realRootId || prev.currentRootId,
+              rootTree: tree.length ? tree : prev.rootTree,
+            };
+          });
+        },
+        onModelStart: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => ({
+            streamingResponses: {
+              ...state.streamingResponses,
+              [key]: { thinking: '', content: '', status: 'thinking', model_name: data.model_name },
+            },
+          }));
+        },
+        onThinking: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => {
+            const resp = state.streamingResponses[key];
+            if (!resp) return state;
+            return {
+              streamingResponses: {
+                ...state.streamingResponses,
+                [key]: { ...resp, thinking: resp.thinking + data.content, status: 'thinking' },
+              },
+            };
+          });
+        },
+        onContent: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => {
+            const resp = state.streamingResponses[key];
+            if (!resp) return state;
+            return {
+              streamingResponses: {
+                ...state.streamingResponses,
+                [key]: { ...resp, content: resp.content + data.content, status: 'responding' },
+              },
+            };
+          });
+        },
+        onModelDone: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => {
+            const resp = state.streamingResponses[key];
+            if (!resp) return state;
+            return {
+              streamingResponses: {
+                ...state.streamingResponses,
+                [key]: {
+                  ...resp,
+                  status: 'done',
+                  response_id: data.response_id,
+                  tokens_input: data.tokens_input || 0,
+                  tokens_output: data.tokens_output || 0,
+                  cost: data.cost || 0,
+                  latency_ms: data.latency_ms,
+                },
+              },
+            };
+          });
+        },
+        onModelError: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => ({
+            streamingResponses: {
+              ...state.streamingResponses,
+              [key]: { thinking: '', content: '', status: 'error', error: data.error, model_name: data.model_name },
+            },
+            error: `${data.model_name || data.model_id}: ${data.error}`,
+          }));
+        },
+        onDone: async () => {
+          const state = get();
+          const key = srKey(realNodeId, modelId);
+          const sr = state.streamingResponses[key];
+          const fallbackResponses = sr ? [{
+            id: (sr as any).response_id || `stream-${modelId}`,
+            node_id: realNodeId,
+            model_id: modelId,
+            content: sr.content,
+            status: sr.status === 'error' ? 'error' : 'completed',
+            tokens_input: (sr as any).tokens_input || 0,
+            tokens_output: (sr as any).tokens_output || 0,
+            latency_ms: (sr as any).latency_ms || null,
+            finish_reason: sr.status === 'error' ? 'error' : 'stop',
+            sources: '[]',
+            meta: sr.thinking ? JSON.stringify({ thinking_content: sr.thinking, source: 'mineru_url', filename, source_url: url }) : JSON.stringify({ source: 'mineru_url', filename, source_url: url }),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            nuts: [],
+            model_name: sr.model_name || 'MinerU PDF',
+          }] : [];
+          const newResponses = await loadNodeResponsesOrFallback(realNodeId, fallbackResponses, 'pdf-url-import');
+
+          set(prev => {
+            const tree = prev.rootTree ? JSON.parse(JSON.stringify(prev.rootTree)) : [];
+            const relation = prev.streamingRelation[realNodeId] || opts.relation || 'progression';
+
+            if (opts.parentId) {
+              const patchChild = (nodes: any[]): boolean => {
+                for (const n of nodes) {
+                  if (n.id === opts.parentId) {
+                    const existing = n.children?.find((c: any) => c.id === realNodeId);
+                    if (existing && newResponses.length > 0) {
+                      existing.responses = mergeResponsesByModel(existing.responses, newResponses);
+                    }
+                    return true;
+                  }
+                  if (n.children?.length && patchChild(n.children)) return true;
+                }
+                return false;
+              };
+              patchChild(tree);
+            } else {
+              const existingRoot = tree.find((n: any) => n.id === realNodeId);
+              if (existingRoot) {
+                existingRoot.responses = mergeResponsesByModel(existingRoot.responses, newResponses);
+              } else {
+                tree.push({
+                  id: realNodeId,
+                  root_id: realRootId,
+                  parent_id: null,
+                  child_order: 0,
+                  content,
+                  relation,
+                  nut_id: null,
+                  parent_model_id: null,
+                  search_enabled: null,
+                  attachments: '[]',
+                  summary: '',
+                  pinned: 0,
+                  archived: 0,
+                  meta: JSON.stringify({ kind: 'pdf_import', filename, source: 'mineru_url', source_url: url }),
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                  responses: newResponses,
+                  children: [],
+                });
+              }
+            }
+
+            const newSids = new Set(prev.streamingNodeIds);
+            newSids.delete(realNodeId);
+            const contentMap = { ...prev.streamingContent };
+            const nutMap = { ...prev.streamingNutId };
+            const relMap = { ...prev.streamingRelation };
+            delete contentMap[realNodeId];
+            delete nutMap[realNodeId];
+            delete relMap[realNodeId];
+
+            return {
+              rootTree: tree,
+              sendingMessage: false,
+              streamingNodeIds: newSids,
+              streamingContent: contentMap,
+              streamingResponses: removeStreamingResponseKeys(prev.streamingResponses, realNodeId, [modelId]),
+              streamingNutId: nutMap,
+              streamingRelation: relMap,
+              scrollToNodeId: null,
+            };
+          });
+
+          try { await get().fetchRoots(); } catch (e) { console.error('[pdf-url-import] fetchRoots failed:', e); }
+        },
+      });
+    } catch (e: any) {
+      console.error('importPdfUrl error:', e);
+      let msg = e?.message || String(e);
+      if (msg === 'Failed to fetch') msg = tr('serverOffline', undefined, getLanguage());
+      set(state => {
+        const newSids = new Set(state.streamingNodeIds);
+        newSids.delete(pendingNodeId);
+        newSids.delete(realNodeId);
+        const contentMap = { ...state.streamingContent };
+        const nutMap = { ...state.streamingNutId };
+        const relMap = { ...state.streamingRelation };
+        delete contentMap[pendingNodeId];
+        delete contentMap[realNodeId];
+        delete nutMap[pendingNodeId];
+        delete nutMap[realNodeId];
+        delete relMap[pendingNodeId];
+        delete relMap[realNodeId];
+        return {
+          error: msg,
+          sendingMessage: false,
+          streamingNodeIds: newSids,
+          streamingContent: contentMap,
+          streamingResponses: removeNodeStreamingResponses(state.streamingResponses, realNodeId),
+          streamingNutId: nutMap,
+          streamingRelation: relMap,
+        };
+      });
+      throw e;
+    }
+  },
+
+  importMarkdown: async (file, opts) => {
+    const rootId = opts.rootId || get().currentRootId;
+    const defaultContent = getLanguage() === 'en' ? `Read Markdown: ${file.name}` : `阅读 Markdown：${file.name}`;
+    const content = opts.cardContent?.trim() || defaultContent;
+    const modelId = 'markdown';
+    const pendingNodeId = `pending-markdown-${Date.now()}`;
+    const switchFocus = !opts.parentId;
+
+    set(state => ({
+      sendingMessage: true,
+      streamingNodeIds: new Set([...state.streamingNodeIds, pendingNodeId]),
+      streamingContent: { ...state.streamingContent, [pendingNodeId]: content },
+      streamingNutId: { ...state.streamingNutId, [pendingNodeId]: null },
+      streamingRelation: { ...state.streamingRelation, [pendingNodeId]: opts.relation || 'progression' },
+      focusedNodeId: switchFocus ? pendingNodeId : (opts.parentId || pendingNodeId),
+    }));
+
+    let realNodeId = pendingNodeId;
+    let realRootId = rootId || '';
+
+    try {
+      await importMarkdownStream({
+        file,
+        rootId: rootId || undefined,
+        parentId: opts.parentId,
+        relation: opts.relation || 'progression',
+        cardContent: content,
+      }, {
+        onNodeCreated: (data) => {
+          realNodeId = data.node_id;
+          realRootId = data.root_id;
+          set(prev => {
+            const tree = prev.rootTree ? JSON.parse(JSON.stringify(prev.rootTree)) : [];
+            const relation = opts.relation || 'progression';
+
+            if (opts.parentId) {
+              const findAndAddChild = (nodes: any[]): boolean => {
+                for (const n of nodes) {
+                  if (n.id === opts.parentId) {
+                    if (!n.children) n.children = [];
+                    if (!n.children.some((c: any) => c.id === realNodeId)) {
+                      n.children.push({
+                        id: realNodeId,
+                        root_id: realRootId,
+                        parent_id: opts.parentId,
+                        child_order: n.children.length,
+                        content,
+                        relation,
+                        nut_id: null,
+                        parent_model_id: modelId,
+                        search_enabled: null,
+                        attachments: '[]',
+                        summary: '',
+                        pinned: 0,
+                        archived: 0,
+                        meta: JSON.stringify({ kind: 'markdown_import', filename: file.name, source: 'upload', card_content: content }),
+                        created_at: new Date().toISOString(),
+                        updated_at: new Date().toISOString(),
+                        responses: [],
+                        children: [],
+                      });
+                    }
+                    return true;
+                  }
+                  if (n.children?.length && findAndAddChild(n.children)) return true;
+                }
+                return false;
+              };
+              findAndAddChild(tree);
+            }
+
+            if (typeof window !== 'undefined' && switchFocus) {
+              window.history.pushState(null, '', '/node/' + realNodeId);
+            }
+
+            const newSids = new Set(prev.streamingNodeIds);
+            newSids.delete(pendingNodeId);
+            newSids.add(realNodeId);
+
+            const contentMap = { ...prev.streamingContent };
+            delete contentMap[pendingNodeId];
+            contentMap[realNodeId] = content;
+
+            const nutMap = { ...prev.streamingNutId };
+            delete nutMap[pendingNodeId];
+            nutMap[realNodeId] = null;
+
+            const relMap = { ...prev.streamingRelation };
+            delete relMap[pendingNodeId];
+            relMap[realNodeId] = relation;
+
+            return {
+              streamingNodeIds: newSids,
+              streamingContent: contentMap,
+              streamingNutId: nutMap,
+              streamingRelation: relMap,
+              focusedNodeId: switchFocus ? realNodeId : (opts.parentId || realNodeId),
+              scrollToNodeId: switchFocus ? null : realNodeId,
+              currentRootId: realRootId || prev.currentRootId,
+              rootTree: tree.length ? tree : prev.rootTree,
+            };
+          });
+        },
+        onModelStart: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => ({
+            streamingResponses: {
+              ...state.streamingResponses,
+              [key]: { thinking: '', content: '', status: 'thinking', model_name: data.model_name },
+            },
+          }));
+        },
+        onThinking: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => {
+            const resp = state.streamingResponses[key];
+            if (!resp) return state;
+            return {
+              streamingResponses: {
+                ...state.streamingResponses,
+                [key]: { ...resp, thinking: resp.thinking + data.content, status: 'thinking' },
+              },
+            };
+          });
+        },
+        onContent: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => {
+            const resp = state.streamingResponses[key];
+            if (!resp) return state;
+            return {
+              streamingResponses: {
+                ...state.streamingResponses,
+                [key]: { ...resp, content: resp.content + data.content, status: 'responding' },
+              },
+            };
+          });
+        },
+        onModelDone: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => {
+            const resp = state.streamingResponses[key];
+            if (!resp) return state;
+            return {
+              streamingResponses: {
+                ...state.streamingResponses,
+                [key]: {
+                  ...resp,
+                  status: 'done',
+                  response_id: data.response_id,
+                  tokens_input: data.tokens_input || 0,
+                  tokens_output: data.tokens_output || 0,
+                  cost: data.cost || 0,
+                  latency_ms: data.latency_ms,
+                },
+              },
+            };
+          });
+        },
+        onModelError: (data) => {
+          const key = srKey(data.node_id, data.model_id);
+          set(state => ({
+            streamingResponses: {
+              ...state.streamingResponses,
+              [key]: { thinking: '', content: '', status: 'error', error: data.error, model_name: data.model_name },
+            },
+            error: `${data.model_name || data.model_id}: ${data.error}`,
+          }));
+        },
+        onDone: async () => {
+          const state = get();
+          const key = srKey(realNodeId, modelId);
+          const sr = state.streamingResponses[key];
+          const fallbackResponses = sr ? [{
+            id: (sr as any).response_id || `stream-${modelId}`,
+            node_id: realNodeId,
+            model_id: modelId,
+            content: sr.content,
+            status: sr.status === 'error' ? 'error' : 'completed',
+            tokens_input: (sr as any).tokens_input || 0,
+            tokens_output: (sr as any).tokens_output || 0,
+            latency_ms: (sr as any).latency_ms || null,
+            finish_reason: sr.status === 'error' ? 'error' : 'stop',
+            sources: '[]',
+            meta: sr.thinking ? JSON.stringify({ thinking_content: sr.thinking, source: 'upload', filename: file.name }) : JSON.stringify({ source: 'upload', filename: file.name }),
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+            nuts: [],
+            model_name: sr.model_name || 'markdown',
+          }] : [];
+          const newResponses = await loadNodeResponsesOrFallback(realNodeId, fallbackResponses, 'markdown-import');
+
+          set(prev => {
+            const tree = prev.rootTree ? JSON.parse(JSON.stringify(prev.rootTree)) : [];
+            const relation = prev.streamingRelation[realNodeId] || opts.relation || 'progression';
+
+            if (opts.parentId) {
+              const patchChild = (nodes: any[]): boolean => {
+                for (const n of nodes) {
+                  if (n.id === opts.parentId) {
+                    const existing = n.children?.find((c: any) => c.id === realNodeId);
+                    if (existing && newResponses.length > 0) {
+                      existing.responses = mergeResponsesByModel(existing.responses, newResponses);
+                    }
+                    return true;
+                  }
+                  if (n.children?.length && patchChild(n.children)) return true;
+                }
+                return false;
+              };
+              patchChild(tree);
+            } else {
+              const existingRoot = tree.find((n: any) => n.id === realNodeId);
+              if (existingRoot) {
+                existingRoot.responses = mergeResponsesByModel(existingRoot.responses, newResponses);
+              } else {
+                tree.push({
+                  id: realNodeId,
+                  root_id: realRootId,
+                  parent_id: null,
+                  child_order: 0,
+                  content,
+                  relation,
+                  nut_id: null,
+                  parent_model_id: null,
+                  search_enabled: null,
+                  attachments: '[]',
+                  summary: '',
+                  pinned: 0,
+                  archived: 0,
+                  meta: JSON.stringify({ kind: 'markdown_import', filename: file.name, source: 'upload', card_content: content }),
+                  created_at: new Date().toISOString(),
+                  updated_at: new Date().toISOString(),
+                  responses: newResponses,
+                  children: [],
+                });
+              }
+            }
+
+            const newSids = new Set(prev.streamingNodeIds);
+            newSids.delete(realNodeId);
+            const contentMap = { ...prev.streamingContent };
+            const nutMap = { ...prev.streamingNutId };
+            const relMap = { ...prev.streamingRelation };
+            delete contentMap[realNodeId];
+            delete nutMap[realNodeId];
+            delete relMap[realNodeId];
+
+            return {
+              rootTree: tree,
+              sendingMessage: false,
+              streamingNodeIds: newSids,
+              streamingContent: contentMap,
+              streamingResponses: removeStreamingResponseKeys(prev.streamingResponses, realNodeId, [modelId]),
+              streamingNutId: nutMap,
+              streamingRelation: relMap,
+              scrollToNodeId: null,
+            };
+          });
+
+          try { await get().fetchRoots(); } catch (e) { console.error('[markdown-import] fetchRoots failed:', e); }
+        },
+      });
+    } catch (e: any) {
+      console.error('importMarkdown error:', e);
+      let msg = e?.message || String(e);
+      if (msg === 'Failed to fetch') msg = tr('serverOffline', undefined, getLanguage());
+      set(state => {
+        const newSids = new Set(state.streamingNodeIds);
+        newSids.delete(pendingNodeId);
+        newSids.delete(realNodeId);
+        const contentMap = { ...state.streamingContent };
+        const nutMap = { ...state.streamingNutId };
+        const relMap = { ...state.streamingRelation };
+        delete contentMap[pendingNodeId];
+        delete contentMap[realNodeId];
+        delete nutMap[pendingNodeId];
+        delete nutMap[realNodeId];
+        delete relMap[pendingNodeId];
+        delete relMap[realNodeId];
+        return {
+          error: msg,
+          sendingMessage: false,
+          streamingNodeIds: newSids,
+          streamingContent: contentMap,
+          streamingResponses: removeNodeStreamingResponses(state.streamingResponses, realNodeId),
           streamingNutId: nutMap,
           streamingRelation: relMap,
         };
@@ -1474,7 +2480,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   /** 获取模型列表 */
   fetchModels: async () => {
-    const { models, selected_model_ids, summary_model_id, thinking_budgets } = await api.listModels();
+    const { models, selected_model_ids, summary_model_id, summary_auto_enabled, thinking_budgets } = await api.listModels();
     set(state => {
       const validModelIds = new Set(models.filter(m => m.deleted !== 1).map(m => m.id));
       const currentValidSelection = state.selectedModelIds.filter(id => validModelIds.has(id));
@@ -1493,9 +2499,9 @@ export const useAppStore = create<AppState>((set, get) => ({
 
       // 首次加载时用后端持久化的 thinking_budgets 初始化（仅当本地为空时）
       if (thinking_budgets && Object.keys(thinking_budgets).length > 0 && Object.keys(state.thinkingBudgets).length === 0) {
-        return { models, selectedModelIds: nextSelectedModelIds, summaryModelId: summary_model_id || '', thinkingBudgets: thinking_budgets };
+        return { models, selectedModelIds: nextSelectedModelIds, summaryModelId: summary_model_id || '', summaryAutoEnabled: summary_auto_enabled, thinkingBudgets: thinking_budgets };
       }
-      return { models, selectedModelIds: nextSelectedModelIds, summaryModelId: summary_model_id || '' };
+      return { models, selectedModelIds: nextSelectedModelIds, summaryModelId: summary_model_id || '', summaryAutoEnabled: summary_auto_enabled };
     });
   },
 
@@ -1515,6 +2521,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ summaryModelId: nextId });
     api.saveSettings({ summary_model_id: nextId }).catch(err => {
       console.error('持久化 summaryModelId 失败:', err);
+    });
+  },
+
+  setSummaryAutoEnabled: (enabled: boolean) => {
+    set({ summaryAutoEnabled: enabled });
+    api.saveSettings({ summary_auto_enabled: String(enabled) }).catch(err => {
+      console.error('持久化 summaryAutoEnabled 失败:', err);
     });
   },
 
@@ -1552,6 +2565,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({
         webSearchEnabled: settings.web_search_enabled === 'true',
         profileInjectionEnabled: profile.injection_enabled !== false,
+        mineruApiKeyConfigured: Boolean(settings.mineru_api_key),
       });
     } catch {}
   },
@@ -1560,55 +2574,76 @@ export const useAppStore = create<AppState>((set, get) => ({
     const prevModels = get().models;
     const prevSelected = get().selectedModelIds;
     const prevSummaryModelId = get().summaryModelId;
+    const prevSummaryAutoEnabled = get().summaryAutoEnabled;
     // 乐观删除
     set(state => ({
       models: state.models.filter(m => m.id !== modelId),
       selectedModelIds: state.selectedModelIds.filter(id => id !== modelId),
       summaryModelId: state.summaryModelId === modelId ? '' : state.summaryModelId,
+      summaryAutoEnabled: state.summaryModelId === modelId ? false : state.summaryAutoEnabled,
     }));
     try {
       await api.deleteModel(modelId);
     } catch (e) {
       // 回滚
-      set({ models: prevModels, selectedModelIds: prevSelected, summaryModelId: prevSummaryModelId });
+      set({ models: prevModels, selectedModelIds: prevSelected, summaryModelId: prevSummaryModelId, summaryAutoEnabled: prevSummaryAutoEnabled });
       throw e;
     }
   },
 
-  generateNodeSummary: async (nodeId: string) => {
+  generateNodeSummary: async (nodeId: string, opts) => {
     if (!get().summaryModelId) return;
-    const result = await api.generateSummary(nodeId);
+    const result = await api.generateSummary(nodeId, opts);
     if (!result.summary || result.disabled || result.skipped || result.updated === false) return;
 
     set(state => {
       const rootTree = state.rootTree ? JSON.parse(JSON.stringify(state.rootTree)) as Node[] : state.rootTree;
       let patched = false;
       if (rootTree) patched = patchNodeSummaryInTree(rootTree, nodeId, result.summary);
+
+      const rootPatch = patchRootSummary(state.roots, nodeId, result.summary);
+      if (rootPatch.patched) patched = true;
+
       const nodeCache = { ...state.nodeCache };
       if (nodeCache[nodeId]) {
         nodeCache[nodeId] = { ...nodeCache[nodeId], summary: result.summary };
         patched = true;
       }
-      return patched ? { rootTree, nodeCache } : {};
+      return patched ? { rootTree, roots: rootPatch.roots, nodeCache } : {};
     });
   },
 
   deleteResponse: async (nodeId: string, responseId: string, modelId: string) => {
-    await api.deleteResponse(responseId);
-    const { currentRootId } = get();
-    if (currentRootId) {
-      await get().openRoot(currentRootId);
-      set(state => {
-        const node = get().getNodeById(nodeId);
-        if (!node) return state;
-        const activeModelId = { ...state.activeModelId };
-        if (activeModelId[nodeId] === modelId) {
-          const nextActive = node.responses?.[0]?.model_id;
-          if (nextActive) activeModelId[nodeId] = nextActive;
-          else delete activeModelId[nodeId];
-        }
-        return { focusedNodeId: nodeId, activeModelId };
-      });
+    const snapshot = {
+      rootTree: get().rootTree,
+      nodeCache: get().nodeCache,
+      activeModelId: get().activeModelId,
+      focusedNodeId: get().focusedNodeId,
+    };
+
+    set(state => {
+      const patched = patchResponseRemoval(state.rootTree, state.nodeCache, nodeId, responseId);
+      if (!patched.removed || !patched.node) return state;
+
+      const activeModelId = { ...state.activeModelId };
+      if (activeModelId[nodeId] === modelId) {
+        const nextActive = patched.node.responses?.[0]?.model_id;
+        if (nextActive) activeModelId[nodeId] = nextActive;
+        else delete activeModelId[nodeId];
+      }
+
+      return {
+        rootTree: patched.rootTree,
+        nodeCache: patched.nodeCache,
+        activeModelId,
+      };
+    });
+
+    try {
+      await api.deleteResponse(responseId);
+    } catch (e) {
+      set(snapshot);
+      throw e;
     }
   },
 
@@ -1732,6 +2767,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     streamingNutId: {},
     streamingRelation: {},
     nodeCache: {},
+    searchScrollTarget: null,
   }),
 
   deleteNode: async (nodeId: string) => {
@@ -1991,4 +3027,68 @@ function _populateCache(cache: Record<string, Node>, node: Node) {
       _populateCache(cache, child);
     }
   }
+}
+
+function patchResponseRemoval(
+  rootTree: Node[] | null,
+  nodeCache: Record<string, Node>,
+  nodeId: string,
+  responseId: string,
+): {
+  rootTree: Node[] | null;
+  nodeCache: Record<string, Node>;
+  node: Node | null;
+  removed: boolean;
+} {
+  let removed = false;
+  let patchedNode: Node | null = null;
+  const patchNode = (node: Node): Node => {
+    let next = node;
+    if (node.id === nodeId) {
+      const responses = node.responses || [];
+      const nextResponses = responses.filter(r => r.id !== responseId);
+      removed = nextResponses.length !== responses.length;
+      if (removed) {
+        next = { ...node, responses: nextResponses };
+        patchedNode = next;
+      }
+    }
+
+    if (next.children?.length) {
+      let childrenChanged = false;
+      const children = next.children.map(child => {
+        const patchedChild = patchNode(child);
+        if (patchedChild !== child) childrenChanged = true;
+        return patchedChild;
+      });
+      if (childrenChanged) next = { ...next, children };
+    }
+
+    return next;
+  };
+
+  const nextRootTree = rootTree ? rootTree.map(patchNode) : rootTree;
+  const cachedNode = nodeCache[nodeId];
+  if (!removed && cachedNode) {
+    const responses = cachedNode.responses || [];
+    const nextResponses = responses.filter(r => r.id !== responseId);
+    removed = nextResponses.length !== responses.length;
+    if (removed) patchedNode = { ...cachedNode, responses: nextResponses };
+  }
+
+  if (!removed || !patchedNode) {
+    return {
+      rootTree,
+      nodeCache,
+      node: null,
+      removed: false,
+    };
+  }
+
+  return {
+    rootTree: nextRootTree,
+    nodeCache: { ...nodeCache, [nodeId]: patchedNode },
+    node: patchedNode,
+    removed: true,
+  };
 }
