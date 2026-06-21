@@ -1,6 +1,7 @@
 import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
+import VisualTooltip from './components/VisualTooltip';
 import './index.css';
 import 'katex/dist/katex.min.css';
 
@@ -18,5 +19,6 @@ document.head.appendChild(highlightStyle);
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <App />
+    <VisualTooltip />
   </React.StrictMode>,
 );

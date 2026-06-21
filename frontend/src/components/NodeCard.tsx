@@ -1,11 +1,14 @@
-import { useState, useRef, useCallback, useEffect, useMemo } from 'react';
+import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { useAppStore } from '../store/appStore';
 import { api } from '../api/client';
 import type { Node } from '../types';
 import ResponseArea from './ResponseArea';
 import MarkdownContent from './MarkdownContent';
-import { BookOpenText, ChevronDown, Crosshair, Ellipsis, Pencil, RefreshCcw, Trash, CircleAlert, FileText, Sparkles } from 'lucide-react';
+import ReferencePreview from './ReferencePreview';
+import { BookOpenText, ChevronDown, ChevronsUpDown, Crosshair, Ellipsis, MoveRight, Pencil, RefreshCcw, Trash, CircleAlert, FileText, Sparkles } from 'lucide-react';
 import { useT } from '../i18n';
+import { getNutReferenceText } from '../utils/referenceText';
 
 /** NodeCard 组件 Props */
 interface Props {
@@ -21,7 +24,7 @@ interface Props {
  * 1. 渲染问题区（折叠箭头 + 问题文本 + 编辑 + 重跑）
  * 2. 折叠状态：每个节点只有 collapsed 一个布尔状态，折叠只影响自身，不影响子节点。
  * 3. 仅点击折叠箭头折叠/展开，双击问题区聚焦该节点
- * 4. ⋯ 菜单：聚焦 / 沉浸式浏览 / 编辑并重跑 / 重跑不修改 / 删除节点
+ * 4. ⋯ 菜单：聚焦 / 切换折叠 / 沉浸式浏览 / 编辑并重跑 / 重跑不修改 / 删除节点
  * 5. 编辑模式（textarea 编辑问题内容）
  * 6. 渲染 ResponseArea 回答区 + progression 子节点
  * 7. 沉浸式浏览（隐藏追问分支）
@@ -35,6 +38,7 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
   const setDescendantsCollapse = useAppStore(s => s.setDescendantsCollapse); // 递归折叠/展开
   const toggleImmersive = useAppStore(s => s.toggleImmersive);     // 沉浸式浏览切换
   const focusNode = useAppStore(s => s.focusNode);                 // 全局聚焦节点
+  const getNodeById = useAppStore(s => s.getNodeById);             // 根据 ID 查找节点
   const models = useAppStore(s => s.models);                       // 模型列表
   const deleteNode = useAppStore(s => s.deleteNode);               // 删除节点
   const rerunNode = useAppStore(s => s.rerunNode);                 // 重跑节点
@@ -78,6 +82,9 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
   // ────── 操作菜单状态 ──────
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null); // 菜单容器 ref，用于外部点击检测
+  const menuButtonRef = useRef<HTMLButtonElement>(null);
+  const menuPopupRef = useRef<HTMLDivElement>(null);
+  const [menuPosition, setMenuPosition] = useState({ top: 0, left: 0 });
 
   // ────── 编辑模式状态 ──────
   const [editing, setEditing] = useState(false);       // 是否处于编辑模式
@@ -109,6 +116,7 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
       // 就地更新 rootTree 中的 node.summary，面包屑 & 折叠态即刻反映
       useAppStore.setState((prev: any) => {
         const tree = prev.rootTree ? JSON.parse(JSON.stringify(prev.rootTree)) : [];
+        const nodeCache = { ...prev.nodeCache };
         const patchNode = (nodes: any[]): boolean => {
           for (const n of nodes) {
             if (n.id === node.id) {
@@ -120,7 +128,11 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
           return false;
         };
         patchNode(tree);
-        return { rootTree: tree };
+        if (nodeCache[node.id]) nodeCache[node.id] = { ...nodeCache[node.id], summary: text };
+        const recentNodes = (prev.recentNodes || []).map((recentNode: any) =>
+          recentNode.id === node.id ? { ...recentNode, summary: text } : recentNode
+        );
+        return { rootTree: tree, nodeCache, recentNodes };
       });
     } catch (e) {
       console.error('保存摘要失败:', e);
@@ -238,6 +250,27 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
     return [...sortedFollowupChildren, ...sortedProgressionChildren];
   }, [sortedFollowupChildren, sortedProgressionChildren]);
 
+  const truncateText = useCallback((text: string, maxLen: number): string => {
+    const chars = Array.from(text.trim());
+    return chars.length > maxLen ? chars.slice(0, maxLen).join('') : chars.join('');
+  }, []);
+
+  const truncateTextWithEllipsis = useCallback((text: string, maxLen: number): string => {
+    const chars = Array.from(text.trim());
+    return chars.length > maxLen ? `${chars.slice(0, maxLen).join('')}...` : chars.join('');
+  }, []);
+
+  const followupQuote = useMemo(() => {
+    if (node.relation !== 'followup' || !node.nut_id || !node.parent_id) return null;
+    const parent = getNodeById(node.parent_id);
+    if (!parent?.responses) return null;
+    for (const response of parent.responses) {
+      const nut = response.nuts?.find(n => n.id === node.nut_id);
+      if (nut) return getNutReferenceText(response.content, nut, nut.label || '');
+    }
+    return null;
+  }, [getNodeById, node.nut_id, node.parent_id, node.relation]);
+
   /**
    * handleToggle — 折叠/展开切换，仅由 collapse-toggle 按钮触发。
    *
@@ -296,11 +329,48 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
   );
 
   // ────── 菜单外部点击关闭 ──────
+  const updateMenuPosition = useCallback(() => {
+    const button = menuButtonRef.current;
+    if (!button) return;
+
+    const rect = button.getBoundingClientRect();
+    const margin = 8;
+    const menuWidth = menuPopupRef.current?.offsetWidth || 220;
+    const menuHeight = menuPopupRef.current?.offsetHeight || 0;
+    const left = Math.max(margin, Math.min(rect.right - menuWidth, window.innerWidth - menuWidth - margin));
+    const belowTop = rect.bottom + 4;
+    const top = menuHeight > 0 && belowTop + menuHeight > window.innerHeight - margin
+      ? Math.max(margin, rect.top - menuHeight - 4)
+      : belowTop;
+
+    setMenuPosition({ top, left });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!menuOpen) return;
+    updateMenuPosition();
+  }, [menuOpen, updateMenuPosition]);
+
+  useEffect(() => {
+    if (!menuOpen) return;
+    document.addEventListener('scroll', updateMenuPosition, true);
+    window.addEventListener('resize', updateMenuPosition);
+    return () => {
+      document.removeEventListener('scroll', updateMenuPosition, true);
+      window.removeEventListener('resize', updateMenuPosition);
+    };
+  }, [menuOpen, updateMenuPosition]);
+
   useEffect(() => {
     if (!menuOpen) return;
     const handleClickOutside = (e: MouseEvent) => {
       // 点击菜单容器外部 → 关闭菜单并重置删除确认
-      if (menuRef.current && !menuRef.current.contains(e.target as globalThis.Node)) {
+      const target = e.target as globalThis.Node;
+      if (
+        menuRef.current &&
+        !menuRef.current.contains(target) &&
+        !menuPopupRef.current?.contains(target)
+      ) {
         setMenuOpen(false);
         setConfirmDelete(false);
       }
@@ -416,6 +486,24 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
     focusNode(node.id);
   };
 
+  /** handleMenuToggleCollapse — 从菜单切换当前节点折叠状态 */
+  const handleMenuToggleCollapse = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!canCollapse) return;
+    setMenuOpen(false);
+    toggleCollapse(node.id);
+  };
+
+  /** handleMenuToggleCollapseWithDescendants — 从菜单切换当前节点及所有子节点折叠状态 */
+  const handleMenuToggleCollapseWithDescendants = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!canCollapse) return;
+    const newCollapsed = !collapsedSet.has(node.id);
+    setMenuOpen(false);
+    toggleCollapse(node.id);
+    setDescendantsCollapse(node.id, newCollapsed);
+  };
+
   /** handleToggleImmersive — 隐藏/恢复当前节点的追问分支 */
   const handleToggleImmersive = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -443,6 +531,8 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
 
   const descCount = countDescendants(node);                // 后代总数
   const showResponses = !hideResponses || isStreaming;      // 流式中即使折叠也显示
+  const questionDisplayText = selfCollapsed && node.summary ? node.summary : node.content;
+  const collapsedFollowupDisplayText = node.summary || truncateTextWithEllipsis(node.content, 10);
 
   const renderQuestionText = (text: string) => {
     if (!questionSearchHit?.query) return text;
@@ -533,7 +623,15 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
           /* 展示态：折叠时有摘要则显示摘要，否则显示问题 */
           <div className="question-display" onDoubleClick={requestDrillIntoNode} title={t('focusNodeHint')}>
             <div className="question-text">
-              {renderQuestionText(selfCollapsed && node.summary ? node.summary : node.content)}
+              {selfCollapsed && followupQuote ? (
+                <>
+                  <ReferencePreview text={followupQuote} />
+                  <MoveRight className="collapsed-reference-arrow" size={13} aria-hidden="true" />
+                  {renderQuestionText(collapsedFollowupDisplayText)}
+                </>
+              ) : (
+                renderQuestionText(questionDisplayText)
+              )}
             </div>
 
             {/* ── 折叠信息指示（自身折叠时显示） ── */}
@@ -566,6 +664,7 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
               <span className="question-actions">
                 <span className="node-menu-container" ref={menuRef}>
                   <button
+                    ref={menuButtonRef}
                     className="node-menu-btn"
                     onClick={(e) => {
                       e.stopPropagation();
@@ -576,11 +675,29 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
                   >
                     <Ellipsis size={18} />
                   </button>
-                  {menuOpen && (
-                    <div className="node-menu">
+                  {menuOpen && createPortal(
+                    <div
+                      className="node-menu"
+                      ref={menuPopupRef}
+                      style={{
+                        position: 'fixed',
+                        top: menuPosition.top,
+                        left: menuPosition.left,
+                        right: 'auto',
+                        zIndex: 10000,
+                      }}
+                    >
                       {/* 聚焦当前节点 */}
                       <button className="menu-item" onClick={handleFocusNode}>
                         <Crosshair size={14} /> {t('focusNode')}
+                      </button>
+                      {/* 折叠当前节点 */}
+                      <button className="menu-item" onClick={handleMenuToggleCollapse} disabled={!canCollapse}>
+                        <ChevronDown size={14} /> {t('toggleCollapse')}
+                      </button>
+                      {/* 折叠当前节点及所有子节点 */}
+                      <button className="menu-item" onClick={handleMenuToggleCollapseWithDescendants} disabled={!canCollapse}>
+                        <ChevronsUpDown size={14} /> {t('toggleCollapseDescendants')}
                       </button>
                       {/* 沉浸式浏览：有追问子节点时显示 */}
                       {hasFollowupChildren && !hideResponses && (
@@ -644,7 +761,8 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
                           : <><Trash size={14} /> {t('deleteNode')}</>
                         }
                       </button>
-                    </div>
+                    </div>,
+                    document.body,
                   )}
                 </span>
               </span>
@@ -657,7 +775,7 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
       <div className="node-content-wrapper">
         <div className="node-content-inner">
           {/* 折叠动画容器：grid 1fr ↔ 0fr 收放 */}
-          {(hasResponses || hasStreamingResponses || (isStreaming && !hasResponses && !hasStreamingResponses)) && (
+          {(showResponses && (hasResponses || hasStreamingResponses || (isStreaming && !hasResponses && !hasStreamingResponses))) && (
             <div className={`node-responses-collapsible${showResponses ? '' : ' collapsed'}`}>
               <div className="node-responses-collapsible-inner">
                 {/* 回答区：展示 ResponseArea 组件 */}

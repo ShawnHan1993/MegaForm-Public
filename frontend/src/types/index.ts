@@ -23,6 +23,10 @@ export interface Node {
   meta: string;         // JSON string
   created_at: string;
   updated_at: string;
+  /** 最近访问列表附加：当前节点的后代数量，用于 sidebar 体量圆点 */
+  child_count?: number;
+  /** 最近访问列表附加：追问节点引用的原文 */
+  followup_quote?: string | null;
   // 从树 API join 来的关联数据
   responses?: Response[];
   children?: Node[];
@@ -151,6 +155,8 @@ export interface ChatRequest {
   model_ids: string[];
   nut_id?: string;                  // 追问时指定被引用的 Nut ID
   partial_content?: string;         // 追问时传入的选中文本
+  followup_seek?: number;           // 追问选区在父回复 Markdown 原文中的起始偏移
+  followup_end_seek?: number;       // 追问选区在父回复 Markdown 原文中的结束偏移
   web_search?: boolean;
   parent_model_id?: string;         // 追问时指定父回复的模型 ID
   relation?: 'followup' | 'progression';

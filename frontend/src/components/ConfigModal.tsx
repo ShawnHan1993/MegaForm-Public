@@ -17,6 +17,7 @@ import { PROVIDER_PRESETS, getCurrencySymbol, type ProviderPreset, type ModelPre
 import { X, Search, AlertTriangle, Activity, CheckCircle2, RefreshCcw, Loader, User, LogOut, FileText, History, Bot, Image as ImageIcon } from 'lucide-react';
 import { LANGUAGES, getLanguage, localizePresetText, localizeSearchProviderText, useLanguage, useT, type Language } from '../i18n';
 import { modelPresetSupportsImageInput, modelSupportsImageInput, withImageInputCapability } from '../utils/multimodal';
+import { setMiniMapEnabled, useMiniMapEnabled } from '../utils/uiPreferences';
 
 interface Props {
   currentUser: CurrentUser | null;
@@ -65,11 +66,15 @@ function ProviderLabel({ provider }: { provider: ProviderPreset }) {
 
 const OPENAI_COMPATIBLE_PROVIDER = 'openai-compatible';
 const CUSTOM_PROVIDER = 'custom';
+const DEFAULT_CONTEXT_MAX_CHARS = 20000;
+const MIN_CONTEXT_MAX_CHARS = 1000;
+const MAX_CONTEXT_MAX_CHARS = 500000;
 
 const normalizeBaseUrl = (url?: string | null) => (url || '').trim().replace(/\/+$/, '').toLowerCase();
 const getPriceCurrencySymbol = (priceUnit?: string | null) => priceUnit === 'USD' ? '$' : '￥';
 const toPricePerMillionTokens = (price?: number | null) => (price ?? 0) * 1000;
 const fromPricePerMillionTokens = (price?: string) => (parseFloat(price || '0') || 0) / 1000;
+const clampContextMaxChars = (value: number) => Math.max(MIN_CONTEXT_MAX_CHARS, Math.min(value, MAX_CONTEXT_MAX_CHARS));
 
 function findActualProviderPreset(model?: Partial<ModelConfig> | null): ProviderPreset | undefined {
   if (!model) return undefined;
@@ -114,6 +119,7 @@ function getProviderDisplayName(model: Partial<ModelConfig>) {
 export default function ConfigModal({ currentUser, localMode, language, onLanguageChange, onLogout, onClose }: Props) {
   const activeLanguage = useLanguage();
   const t = useT();
+  const miniMapEnabled = useMiniMapEnabled();
   const models = useAppStore(s => s.models);
   // 过滤已删除的模型（deleted 为1表示标记为删除）
   const visibleModels = models.filter(m => m.deleted !== 1);
@@ -155,6 +161,10 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
   const [profileLoaded, setProfileLoaded] = useState(false);
   const [profileSaving, setProfileSaving] = useState(false);
   const [profileSaved, setProfileSaved] = useState(false);
+  const [accountSettingsLoaded, setAccountSettingsLoaded] = useState(false);
+  const [contextMaxChars, setContextMaxChars] = useState(String(DEFAULT_CONTEXT_MAX_CHARS));
+  const [contextMaxCharsSaving, setContextMaxCharsSaving] = useState(false);
+  const [contextMaxCharsSaved, setContextMaxCharsSaved] = useState(false);
 
   const loadSearchConfig = async () => {
     try {
@@ -181,6 +191,30 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
       setMineruIsOcr((settings as any).mineru_is_ocr === 'true');
       setMineruLoaded(true);
     } catch { /* ignore */ }
+  };
+
+  const loadAccountSettings = async () => {
+    try {
+      const settings = await api.getSettings();
+      setContextMaxChars((settings as any).context_max_chars || String(DEFAULT_CONTEXT_MAX_CHARS));
+      setAccountSettingsLoaded(true);
+    } catch {
+      setAccountSettingsLoaded(true);
+    }
+  };
+
+  const saveContextMaxChars = async () => {
+    setContextMaxCharsSaving(true);
+    setContextMaxCharsSaved(false);
+    const parsed = parseInt(contextMaxChars, 10);
+    const normalized = clampContextMaxChars(Number.isFinite(parsed) ? parsed : DEFAULT_CONTEXT_MAX_CHARS);
+    try {
+      await api.saveSettings({ context_max_chars: String(normalized) });
+      setContextMaxChars(String(normalized));
+      setContextMaxCharsSaved(true);
+      setTimeout(() => setContextMaxCharsSaved(false), 2000);
+    } catch { /* ignore */ }
+    setContextMaxCharsSaving(false);
   };
 
   const saveSearchConfig = async () => {
@@ -559,6 +593,7 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
           <button
             onClick={() => {
               setActiveTab('account');
+              if (!accountSettingsLoaded) loadAccountSettings();
               if (!profileLoaded) loadProfile();
             }}
             className={`model-chip ${activeTab === 'account' ? 'active' : ''}`}
@@ -1296,6 +1331,51 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                   <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </select>
+            </div>
+
+            <div className="account-settings-section">
+              <div className="account-settings-title">{t('miniMap')}</div>
+              <div className="account-settings-copy">{t('miniMapHint')}</div>
+              <label className="account-toggle-row">
+                <input
+                  type="checkbox"
+                  checked={miniMapEnabled}
+                  onChange={e => setMiniMapEnabled(e.target.checked)}
+                />
+                <span>{miniMapEnabled ? t('enabled') : t('disabled')}</span>
+              </label>
+            </div>
+
+            <div className="account-settings-section">
+              <div className="account-settings-title">{t('contextMaxChars')}</div>
+              <div className="account-settings-copy">
+                {t('contextMaxCharsHint', { min: MIN_CONTEXT_MAX_CHARS, max: MAX_CONTEXT_MAX_CHARS })}
+              </div>
+              <div className="account-setting-row">
+                <input
+                  className="config-input"
+                  type="number"
+                  min={MIN_CONTEXT_MAX_CHARS}
+                  max={MAX_CONTEXT_MAX_CHARS}
+                  step={1000}
+                  value={contextMaxChars}
+                  onChange={e => setContextMaxChars(e.target.value)}
+                  onBlur={() => {
+                    const parsed = parseInt(contextMaxChars, 10);
+                    setContextMaxChars(String(clampContextMaxChars(Number.isFinite(parsed) ? parsed : DEFAULT_CONTEXT_MAX_CHARS)));
+                  }}
+                />
+                <button
+                  className="btn btn-primary"
+                  onClick={saveContextMaxChars}
+                  disabled={contextMaxCharsSaving || !accountSettingsLoaded}
+                >
+                  {contextMaxCharsSaving ? t('saving') : t('save')}
+                </button>
+                {contextMaxCharsSaved && (
+                  <span className="profile-saved"><CheckCircle2 size={13} /> {t('saved')}</span>
+                )}
+              </div>
             </div>
 
             <div className="account-settings-section">

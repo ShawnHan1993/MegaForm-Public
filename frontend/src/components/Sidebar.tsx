@@ -11,19 +11,22 @@
 import { useState, useRef, useEffect, useMemo } from 'react';
 import { useAppStore } from '../store/appStore';
 import { api } from '../api/client';
-import type { Root } from '../types';
+import type { Node, Root } from '../types';
 import {
   ChevronDown,
   ChevronRight,
   Folder,
   FolderPlus,
   MessageSquare,
+  MoveRight,
   Pencil,
+  Presentation,
   Search,
   Settings,
   X,
 } from 'lucide-react';
 import { getLanguage, tr, useT } from '../i18n';
+import ReferencePreview from './ReferencePreview';
 
 // ── 时间格式化 ──
 
@@ -67,11 +70,13 @@ interface SearchResult {
 }
 
 const DEFAULT_GROUP_ID = '__default__';
+const LS_RECENT_GROUP_COLLAPSED = 'megaform-recent-group-collapsed';
 
 export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
   const t = useT();
   const roots = useAppStore(s => s.roots);
   const rootGroups = useAppStore(s => s.rootGroups);
+  const recentNodes = useAppStore(s => s.recentNodes);
   const currentRootId = useAppStore(s => s.currentRootId);
   const openRoot = useAppStore(s => s.openRoot);
   const focusNode = useAppStore(s => s.focusNode);
@@ -88,7 +93,6 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
     () => Math.max(1, ...roots.map(root => root.node_count ?? 0)),
     [roots],
   );
-
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [showSearch, setShowSearch] = useState(false);
@@ -97,12 +101,17 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
   const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null);
   const [moveMenuRootId, setMoveMenuRootId] = useState<string | null>(null);
   const [defaultGroupCollapsed, setDefaultGroupCollapsed] = useState(false);
+  const [recentGroupCollapsed, setRecentGroupCollapsed] = useState(
+    () => localStorage.getItem(LS_RECENT_GROUP_COLLAPSED) === '1',
+  );
+  const [exitingRecentNodes, setExitingRecentNodes] = useState<Node[]>([]);
 
   // ── 摘要编辑状态 ──
   const [editingSummaryId, setEditingSummaryId] = useState<string | null>(null);
   const [editingSummaryText, setEditingSummaryText] = useState('');
   const editInputRef = useRef<HTMLInputElement>(null);
   const dragImageRef = useRef<HTMLElement | null>(null);
+  const previousRecentNodesRef = useRef<Node[]>([]);
 
   const rootsByGroup = useMemo(() => {
     const map: Record<string, Root[]> = { [DEFAULT_GROUP_ID]: [] };
@@ -131,6 +140,22 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
     }
   }, [editingSummaryId]);
 
+  useEffect(() => {
+    const nextIds = new Set(recentNodes.map(n => n.id));
+    const removed = previousRecentNodesRef.current.filter(n => !nextIds.has(n.id));
+    if (removed.length > 0) {
+      const removedIds = new Set(removed.map(n => n.id));
+      setExitingRecentNodes(prev => [
+        ...prev.filter(n => !removedIds.has(n.id)),
+        ...removed,
+      ]);
+      window.setTimeout(() => {
+        setExitingRecentNodes(prev => prev.filter(n => !removedIds.has(n.id)));
+      }, 220);
+    }
+    previousRecentNodesRef.current = recentNodes;
+  }, [recentNodes]);
+
   /** 保存摘要 */
   const saveSummary = async (rootId: string) => {
     const text = editingSummaryText.trim();
@@ -138,6 +163,14 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
     try {
       await api.updateRoot(rootId, { summary: text } as any);
       const store = useAppStore.getState();
+      useAppStore.setState((prev: any) => ({
+        recentNodes: (prev.recentNodes || []).map((node: any) =>
+          node.id === rootId ? { ...node, summary: text } : node
+        ),
+        nodeCache: prev.nodeCache?.[rootId]
+          ? { ...prev.nodeCache, [rootId]: { ...prev.nodeCache[rootId], summary: text } }
+          : prev.nodeCache,
+      }));
       store.fetchRoots();
     } catch {
       // 静默失败，下次 fetchRoots 会同步
@@ -181,7 +214,7 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
     if (!r.root_id || !nodeId) return;
 
     setShowSearch(false);
-    await openRoot(r.root_id);
+    await openRoot(r.root_id, { markRecent: false });
     if (r.type === 'response' && r.model_id) {
       setActiveModelId(nodeId, r.model_id);
     }
@@ -277,9 +310,84 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
     return Math.min(4, Math.max(1, Math.ceil(normalized * 4)));
   };
 
+  const truncateTextWithEllipsis = (text: string, maxLen: number): string => {
+    const chars = Array.from(text.trim());
+    return chars.length > maxLen ? `${chars.slice(0, maxLen).join('')}...` : chars.join('');
+  };
+
   const moveRootFromMenu = async (rootId: string, groupId: string | null) => {
     await moveRootToGroup(rootId, groupId);
     setMoveMenuRootId(null);
+  };
+
+  const handleRecentNodeSelect = async (node: Node) => {
+    if (node.root_id && currentRootId !== node.root_id) {
+      await openRoot(node.root_id, { markRecent: false });
+    }
+    focusNode(node.id);
+    window.history.pushState(null, '', '/node/' + node.id);
+    onRootSelect();
+  };
+
+  const renderRecentNodeItem = (node: Node, exiting = false) => {
+    const text = node.summary || node.content;
+    const followupQuote = node.relation === 'followup' ? node.followup_quote?.trim() : '';
+    return (
+      <button
+        key={`${exiting ? 'exit' : 'recent'}-${node.id}`}
+        className={`recent-node-item${exiting ? ' exiting' : ''}`}
+        onClick={() => !exiting && handleRecentNodeSelect(node)}
+        disabled={exiting}
+        title={node.content}
+      >
+        <span className="recent-node-dot" aria-hidden="true" />
+        <span className="question-display recent-node-display">
+          <span className="question-text">
+            {followupQuote ? (
+              <>
+                <ReferencePreview text={followupQuote} />
+                <MoveRight className="collapsed-reference-arrow" size={13} aria-hidden="true" />
+                {text}
+              </>
+            ) : (
+              text
+            )}
+          </span>
+        </span>
+      </button>
+    );
+  };
+
+  const renderRecentGroup = () => {
+    const displayExiting = exitingRecentNodes.filter(n => !recentNodes.some(r => r.id === n.id));
+    const toggleRecentCollapsed = () => {
+      setRecentGroupCollapsed(value => {
+        const next = !value;
+        localStorage.setItem(LS_RECENT_GROUP_COLLAPSED, next ? '1' : '0');
+        return next;
+      });
+    };
+    return (
+      <div className="sidebar-group recent-sidebar-group">
+        <div className="sidebar-section-title sidebar-group-title no-actions">
+          <button
+            className="sidebar-group-collapse"
+            onClick={toggleRecentCollapsed}
+            title={recentGroupCollapsed ? t('expandGroup') : t('collapseGroup')}
+          >
+            {recentGroupCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+          </button>
+          <Presentation size={16} />
+          <span>{t('recentVisited')}</span>
+        </div>
+        <div className={`sidebar-group-body ${recentGroupCollapsed ? 'collapsed' : 'expanded'}`}>
+          <div className="root-list recent-node-list">
+            {recentNodes.map(node => renderRecentNodeItem(node, false))}
+            {displayExiting.map(node => renderRecentNodeItem(node, true))}
+          </div>
+        </div>
+      </div>
+    );
   };
 
   const renderMoveMenu = (root: Root) => (
@@ -517,6 +625,7 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
       </div>
 
       <div className="sidebar-groups">
+        {renderRecentGroup()}
         {rootGroups.map(group => renderGroupSection(
           group.id,
           group.name,

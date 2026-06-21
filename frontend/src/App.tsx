@@ -38,7 +38,7 @@ function parseUrlPath(): { rootId: string; nodeId?: string } | null {
  * 根据 URL 深链接执行导航（供初始加载 & popstate 共用）
  */
 async function navigateFromUrl(
-  openRoot: (id: string) => Promise<void>,
+  openRoot: (id: string, opts?: { markRecent?: boolean }) => Promise<void>,
   focusNode: (id: string) => void,
   fetchRoots: () => Promise<void>,
 ) {
@@ -54,7 +54,7 @@ async function navigateFromUrl(
         return;
       }
       await fetchRoots();
-      await openRoot(node.root_id);
+      await openRoot(node.root_id, { markRecent: false });
       focusNode(parsed.nodeId);
     } else {
       // /root/:rootId — 直接载入问题树
@@ -70,6 +70,7 @@ export default function App() {
   const language = useLanguage();
   const t = useT();
   const fetchRoots = useAppStore(s => s.fetchRoots);
+  const fetchRecentNodes = useAppStore(s => s.fetchRecentNodes);
   const fetchModels = useAppStore(s => s.fetchModels);
   const fetchWebSearchEnabled = useAppStore(s => s.fetchWebSearchEnabled);
   const openRoot = useAppStore(s => s.openRoot);
@@ -158,9 +159,10 @@ export default function App() {
   useEffect(() => {
     if (authLoading || !currentUser) return;
     fetchRoots();
+    fetchRecentNodes();
     fetchModels();
     fetchWebSearchEnabled();
-  }, [authLoading, currentUser, fetchRoots, fetchModels, fetchWebSearchEnabled]);
+  }, [authLoading, currentUser, fetchRoots, fetchRecentNodes, fetchModels, fetchWebSearchEnabled]);
 
   // ── URL 深链接：初始加载 & 浏览器前进后退 ──
   const isInitialMount = useRef(true);

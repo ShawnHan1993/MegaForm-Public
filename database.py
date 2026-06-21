@@ -1479,6 +1479,25 @@ def get_node_children(nid: str, parent_model_id: str=None, user_id: str = LOCAL_
     return [dict(r) for r in rows]
 
 
+def count_descendants(nid: str, user_id: str = LOCAL_USER_ID) -> int:
+    """Count all descendants under a node."""
+    conn = get_db()
+    row = conn.execute(
+        """WITH RECURSIVE descendants(id) AS (
+               SELECT id FROM nodes WHERE parent_id=? AND user_id=?
+               UNION ALL
+               SELECT child.id
+                 FROM nodes AS child
+                 JOIN descendants AS parent ON child.parent_id = parent.id
+                WHERE child.user_id=?
+           )
+           SELECT COUNT(*) AS count FROM descendants""",
+        (nid, user_id, user_id),
+    ).fetchone()
+    conn.close()
+    return int(row["count"] or 0) if row else 0
+
+
 def get_nodes_created_between(
     user_id: str,
     start_at: str,
@@ -1502,7 +1521,7 @@ def get_nodes_created_between(
 
 
 def get_path_to_root(nid: str, reverse=True, user_id: str = LOCAL_USER_ID) -> list[dict]:
-    """从当前节点沿 parent_id 向上追溯到根"""
+    """从当前节点沿 parent_id 向上追溯到根，给出的列表顺序，当reverse为True的时候是自顶向下顺序"""
     conn = get_db()
     path = []
     current = nid
@@ -1606,6 +1625,27 @@ def delete_subtree(nid: str, user_id: str = LOCAL_USER_ID) -> int:
     conn.commit()
     conn.close()
     return len(all_ids)
+
+
+def get_subtree_node_ids(nid: str, user_id: str = LOCAL_USER_ID) -> list[str]:
+    """返回节点及其所有后代 ID。"""
+    conn = get_db()
+    if not conn.execute("SELECT 1 FROM nodes WHERE id=? AND user_id=?", (nid, user_id)).fetchone():
+        conn.close()
+        return []
+
+    all_ids: list[str] = []
+    queue = [nid]
+    while queue:
+        current = queue.pop(0)
+        all_ids.append(current)
+        children = conn.execute(
+            "SELECT id FROM nodes WHERE parent_id=? AND user_id=?", (current, user_id)
+        ).fetchall()
+        for child in children:
+            queue.append(child["id"])
+    conn.close()
+    return all_ids
 
 
 def get_node_meta(nid: str, user_id: str = LOCAL_USER_ID) -> dict:

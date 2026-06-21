@@ -2,6 +2,11 @@ import unicodedata
 
 from app_state import _build_system_prompt, _get_user_language, db, re
 
+CONTEXT_MAX_CHARS_SETTING = "context_max_chars"
+DEFAULT_CONTEXT_MAX_CHARS = 20000
+MIN_CONTEXT_MAX_CHARS = 1000
+MAX_CONTEXT_MAX_CHARS = 500000
+
 _UNICODE_SCRIPT_MAP = str.maketrans({
     "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
     "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
@@ -12,6 +17,25 @@ _UNICODE_SCRIPT_MAP = str.maketrans({
     "ᵢ": "i", "ⱼ": "j", "ₖ": "k", "ₗ": "l", "ₘ": "m",
     "ₙ": "n", "ₚ": "p", "ᵣ": "r", "ₛ": "s", "ₜ": "t",
 })
+
+_MARKDOWN_HEADING_RE = re.compile(r"(?m)^#{1,6}(?:\s+|$)")
+
+
+def get_context_max_chars(user_id: str = db.LOCAL_USER_ID) -> int:
+    raw = db.get_setting(CONTEXT_MAX_CHARS_SETTING, str(DEFAULT_CONTEXT_MAX_CHARS), user_id=user_id)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_CONTEXT_MAX_CHARS
+    return max(MIN_CONTEXT_MAX_CHARS, min(value, MAX_CONTEXT_MAX_CHARS))
+
+
+def normalize_context_max_chars(value) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = DEFAULT_CONTEXT_MAX_CHARS
+    return max(MIN_CONTEXT_MAX_CHARS, min(parsed, MAX_CONTEXT_MAX_CHARS))
 
 def _get_nut_text(nut_id: str, user_id: str = db.LOCAL_USER_ID) -> str | None:
     """根据 nut_id 获取螺母对应的选中文本"""
@@ -59,6 +83,47 @@ def _wrap_followup_content(quote: str, question: str, language: str) -> str:
     return f"针对你上面答复的「{quote}」这段话，继续提出如下问题：\n{question}。请不要做过多延伸，恰到好处就行。"
 
 
+def _trim_to_next_heading_after_seek(raw: str, end_seek: int) -> str:
+    start = max(0, min(int(end_seek or 0), len(raw)))
+    match = _MARKDOWN_HEADING_RE.search(raw, start)
+    if not match:
+        return raw
+    return raw[:match.start()].rstrip()
+
+
+def _followup_context_end_seek(
+    response: dict,
+    next_node: dict | None,
+    relation: str | None,
+    current_nut_id: str | None,
+    current_followup_end_seek: int | str | None,
+    user_id: str,
+) -> int | None:
+    """返回下一步追问在当前 response 中的 end_seek。"""
+    nut_id = None
+    if next_node and next_node.get("relation") == "followup":
+        nut_id = next_node.get("nut_id")
+    elif next_node is None and relation == "followup":
+        nut_id = current_nut_id
+
+    if nut_id:
+        nut = db.get_nut(nut_id, user_id=user_id)
+        if nut and nut.get("response_id") == response.get("id"):
+            try:
+                return int(nut.get("end_seek") or 0)
+            except (TypeError, ValueError):
+                return None
+
+    if next_node is None and relation == "followup" and current_followup_end_seek is not None:
+        try:
+            end = int(current_followup_end_seek)
+            raw = response.get("content") or ""
+            return max(0, min(end, len(raw))) if end > 0 else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def build_context(
     parent_node_id: str | None,
     content: str,
@@ -66,6 +131,7 @@ def build_context(
     current_node_id: str | None = None,
     current_nut_id: str | None = None,
     current_partial_content: str | None = None,
+    current_followup_end_seek: int | str | None = None,
     current_parent_model_id: str | None = None,
     relation: str | None = None,
     user_id: str = db.LOCAL_USER_ID,
@@ -81,6 +147,7 @@ def build_context(
     3. 回答按优先级: 每个祖先节点优先使用通向下一个节点的 parent_model_id；
        路径末尾的父节点使用当前请求的 current_parent_model_id；
        无法确定时再用 model_id 匹配 → 任意一个
+       如果通向下一个节点的是 followup，则只保留当前回答开头到追问锚点后的下一个 heading 之前
     4. 如果节点是 followup 且有 nut_id，在用户消息前插入
        "针对你上面答复的「xxx」内容，继续提出如下问题" 的上下文提示
     5. 最后追加当前用户消息，如果当前消息也是 followup，
@@ -138,8 +205,19 @@ def build_context(
         else:
             best = _select_best_response(resps, model_id, None)
         if best:
+            assistant_content = best["content"]
+            followup_end_seek = _followup_context_end_seek(
+                best,
+                next_node,
+                relation,
+                current_nut_id,
+                current_followup_end_seek,
+                user_id,
+            )
+            if followup_end_seek is not None:
+                assistant_content = _trim_to_next_heading_after_seek(assistant_content, followup_end_seek)
             messages.append({"role": "user", "content": user_content})
-            messages.append({"role": "assistant", "content": best["content"]})
+            messages.append({"role": "assistant", "content": assistant_content})
 
     # ── 当前 Progression 节点的兄弟节点上下文 ──
     # 新建节点尚无 child_order，所有已存在的 progression 兄弟都在其之前。
@@ -170,7 +248,7 @@ def build_context(
     messages.append({"role": "user", "content": current_user_content})
 
     # 截断过长上下文
-    max_chars = 80000
+    max_chars = get_context_max_chars(user_id=user_id)
     total = sum(len(m["content"]) for m in messages)
     while total > max_chars and len(messages) > 2:
         dropped = messages.pop(0)

@@ -196,9 +196,7 @@ MINERU_USAGE_CALLS_SETTING = "mineru_pdf_call_count"
 MINERU_USAGE_INPUT_SETTING = "mineru_pdf_input_tokens"
 MINERU_USAGE_OUTPUT_SETTING = "mineru_pdf_output_tokens"
 NODE_SUMMARY_MIN_TOKENS = 30
-SUMMARY_MAX_TOKENS = 25
 ROOT_SUMMARY_DEBOUNCE_SECONDS = int(os.environ.get("MEGAFORM_ROOT_SUMMARY_DEBOUNCE_SECONDS", "3600"))
-ROOT_SUMMARY_MIN_NODES = 3
 ROOT_SUMMARY_DAILY_HOUR = int(os.environ.get("MEGAFORM_ROOT_SUMMARY_DAILY_HOUR", "3"))
 PROFILE_UPDATE_HOUR = int(os.environ.get("MEGAFORM_PROFILE_UPDATE_HOUR", "3"))
 PROFILE_MAX_CHARS = 800
@@ -261,12 +259,17 @@ def _estimate_tokens(text: str) -> int:
 
 def _clean_summary(text: str) -> str:
     text = re.sub(r"^[\s\"'“”‘’`]+|[\s\"'“”‘’`。.!！?？]+$", "", text.strip())
+    text = re.sub(r"^(摘要|总结|summary)\s*[:：]\s*", "", text, flags=re.IGNORECASE).strip()
+    meta_probe = re.sub(r"^[\s>*_\-`#]+", "", text)
+    meta_probe = re.sub(r"^(?:\*\s*)+", "", meta_probe).strip()
+    meta_patterns = [
+        r"^(draft|analysis|analyze the input|step\s*\d+|reasoning)\b",
+        r"^(let me|we need to|i need to|the user asks)\b",
+    ]
+    if any(re.search(pattern, meta_probe, flags=re.IGNORECASE) for pattern in meta_patterns):
+        return ""
     text = re.sub(r"\s+", " ", text)
-    if _estimate_tokens(text) <= SUMMARY_MAX_TOKENS:
-        return text
-    if re.search(r"\s", text):
-        return " ".join(text.split()[:SUMMARY_MAX_TOKENS]).strip()
-    return text[:SUMMARY_MAX_TOKENS * 2].strip()
+    return text
 
 
 def _summary_changed_enough(old: str, new: str) -> bool:
@@ -283,13 +286,23 @@ async def _call_summary_model(prompt: str, user_id: str = db.LOCAL_USER_ID) -> s
     cfg = _get_summary_model_config(user_id=user_id)
     if not cfg:
         return ""
+    language = _get_user_language(user_id)
+    system_prompt = (
+        "You are a title generator. Return only the final short readable title. "
+        "Never output analysis, drafts, steps, labels, markdown, or explanations."
+        if language == "en"
+        else "你是标题生成器。只输出最终的简短可读标题。禁止输出分析过程、草稿、步骤、标签、Markdown 或解释。"
+    )
     full_content = ""
     async for chunk in chat_completion_stream(
         cfg,
-        [{"role": "user", "content": prompt}],
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ],
         thinking_budget=0,
         search_config=None,
-        language=_get_user_language(user_id),
+        language=language,
     ):
         log.info("summary chunk: %s %.80r", chunk.get("type"), chunk.get("content", ""))
         pass
@@ -494,46 +507,12 @@ async def _update_profile_daily(user_id: str, nodes: list[dict]) -> bool:
     return True
 
 
-def _node_depth_from_root(node_id: str, user_id: str = db.LOCAL_USER_ID) -> int | None:
-    path = db.get_path_to_root(node_id, user_id=user_id)
-    if not path:
-        return None
-    return len(path) - 1
-
-
 def _mark_root_summary_dirty_if_shallow_node(node_id: str, user_id: str = db.LOCAL_USER_ID):
     node = db.get_node(node_id, user_id=user_id)
     if not node:
         return
-    depth = _node_depth_from_root(node_id, user_id=user_id)
-    if depth is not None and depth <= 1:
+    if node["id"] == node["root_id"]:
         _mark_root_summary_dirty(node["root_id"], user_id=user_id)
-
-
-def _root_shallow_node_lines(root_id: str, user_id: str = db.LOCAL_USER_ID) -> list[str]:
-    language = _get_user_language(user_id)
-    nodes = db.get_root_nodes(root_id, user_id=user_id)
-    by_id = {n["id"]: n for n in nodes}
-    lines = []
-    for node in nodes:
-        depth = 0
-        parent_id = node.get("parent_id")
-        while parent_id and parent_id in by_id:
-            depth += 1
-            parent_id = by_id[parent_id].get("parent_id")
-        if depth <= 1:
-            summary = (node.get("summary") or "").strip()
-            content = re.sub(r"\s+", " ", node.get("content") or "").strip()
-            label = ("Root" if depth == 0 else "Level 2") if language == "en" else ("第一层" if depth == 0 else "第二层")
-            if summary:
-                lines.append(f"- {label}: {summary} | {content[:500]}")
-            else:
-                lines.append(f"- {label}: {content[:500]}")
-    return lines
-
-
-def _root_has_enough_nodes_for_summary(root_id: str, user_id: str = db.LOCAL_USER_ID) -> bool:
-    return len(db.get_root_nodes(root_id, user_id=user_id)) >= ROOT_SUMMARY_MIN_NODES
 
 
 async def _generate_root_summary(root_id: str, user_id: str = db.LOCAL_USER_ID):
@@ -542,25 +521,22 @@ async def _generate_root_summary(root_id: str, user_id: str = db.LOCAL_USER_ID):
     root = db.get_root(root_id, user_id=user_id)
     if not root:
         return
-    if not _root_has_enough_nodes_for_summary(root_id, user_id=user_id):
-        log.info("summary: root=%s 节点数不足 %d，跳过", root_id, ROOT_SUMMARY_MIN_NODES)
-        return
-    lines = _root_shallow_node_lines(root_id, user_id=user_id)
-    if not lines:
+    content = re.sub(r"\s+", " ", root.get("content") or "").strip()
+    if not content:
         return
     if _get_user_language(user_id) == "en":
         prompt = (
-            "Based only on the root node and second-level nodes below, generate an English summary. "
-            "Requirements: within 25 tokens; do not explain; do not add quotes; output only the summary. "
-            "If there is little information, still summarize the core topic.\n\n"
-            + "\n".join(lines[:60])
+            "Summarize the core topic of the following user question in English. "
+            "Use only this question text. Ignore child nodes, answers, and any other context. "
+            "Requirements: within 25 tokens; output a complete phrase; no quotes; no final period; output only the summary:\n\n"
+            f"{content[:2000]}"
         )
     else:
         prompt = (
-            "请只根据下面这个问题树的根节点和第二层节点，生成一个中文摘要。"
-            "要求：25个token以内；不要解释；不要加引号；直接输出摘要。"
-            "如果信息很少，也要概括核心主题。\n\n"
-            + "\n".join(lines[:60])
+            "请用中文概括以下用户问题的核心内容。只根据这段问题原文生成，"
+            "不要参考子节点、回答或任何其他上下文。要求：25个token以内；语义完整；"
+            "不要加引号、不要加句号；直接输出摘要：\n\n"
+            f"{content[:2000]}"
         )
     try:
         summary = await _call_summary_model(prompt, user_id=user_id)
@@ -575,8 +551,6 @@ def _mark_root_summary_dirty(root_id: str, user_id: str = db.LOCAL_USER_ID):
     if not root_id:
         return
     if not _get_summary_auto_enabled(user_id=user_id):
-        return
-    if not _root_has_enough_nodes_for_summary(root_id, user_id=user_id):
         return
     existing = _root_summary_tasks.pop(root_id, None)
     if existing and not existing.done():
@@ -615,9 +589,8 @@ async def _run_daily_root_summary_scan():
         r for r in roots
         if _get_summary_auto_enabled(user_id=r["user_id"])
         and _get_summary_model_id(user_id=r["user_id"])
-        and int(r.get("node_count") or 0) >= ROOT_SUMMARY_MIN_NODES
     ]
-    log.info("summary-daily: 扫描 %d 个 root，其中 %d 个满足节点数门槛", len(roots), len(eligible))
+    log.info("summary-daily: 扫描 %d 个 root，其中 %d 个启用自动摘要", len(roots), len(eligible))
     for root in eligible:
         await _generate_root_summary(root["id"], user_id=root["user_id"])
         await asyncio.sleep(0)

@@ -276,9 +276,22 @@ export default function InputBar() {
   const focusedNode = focusedNodeId && rootTree
     ? getNodeById(rootTree, focusedNodeId)
     : null;
+  const isChildProgressionNode = Boolean(
+    focusedNode &&
+    focusedNode.relation === 'progression' &&
+    focusedNode.parent_id,
+  );
 
   const hasImageAttachment = Boolean(imageAttachment);
   const hasDocumentAttachment = Boolean(documentAttachment);
+
+  useEffect(() => {
+    if (!isChildProgressionNode) return;
+    setUploadFormOpen(false);
+    setThinkingPopoverFor(null);
+    setThinkingPopoverPosition(null);
+    thinkingPopoverTriggerRef.current = null;
+  }, [isChildProgressionNode]);
 
   useEffect(() => {
     if (!hasImageAttachment) return;
@@ -291,6 +304,7 @@ export default function InputBar() {
 
   // V3: 统一发送 — 始终作为聚焦节点的 progression 子节点
   const handleSend = async () => {
+    if (isChildProgressionNode) return;
     const text = input.trim() || (imageAttachment ? (language === 'en' ? 'Please answer based on the attached image.' : '请基于附图回答。') : '');
     if (!text) return;
     if (documentAttachment) {
@@ -354,6 +368,7 @@ export default function InputBar() {
   };
 
   const openUploadForm = () => {
+    if (isChildProgressionNode) return;
     if (sendingMessage) return;
     resetUploadForm();
     updateUploadFormPosition();
@@ -361,6 +376,7 @@ export default function InputBar() {
   };
 
   const submitPdfUrlImport = async (url: string, nodeContent: string) => {
+    if (isChildProgressionNode) return;
     if (sendingMessage || !mineruApiKeyConfigured) return;
     const filename = filenameFromPdfUrl(url);
 
@@ -384,6 +400,7 @@ export default function InputBar() {
   };
 
   const submitFileImport = async (file: File, nodeContent: string) => {
+    if (isChildProgressionNode) return;
     if (!file || sendingMessage) return;
     const lower = file.name.toLowerCase();
     const isPdf = lower.endsWith('.pdf') || file.type === 'application/pdf';
@@ -547,6 +564,7 @@ export default function InputBar() {
 
   // 输入框提示文字
   const getPlaceholder = () => {
+    if (isChildProgressionNode) return t('progressionLockedPlaceholder');
     if (documentAttachment) return language === 'en' ? 'Enter the node-card content for this attachment...' : '输入这个附件的 node-card 内容...';
     if (!currentRootId) return t('inputQuestion');
     if (focusedNode) {
@@ -557,14 +575,18 @@ export default function InputBar() {
   };
 
   return (
-    <div className={`input-bar${currentRootId ? ' root-mode' : ''}`}>
-      <div className="input-wrapper">
+    <div className={`input-bar${currentRootId ? ' root-mode' : ''}${isChildProgressionNode ? ' progression-locked' : ''}`}>
+      <div className={`input-wrapper${isChildProgressionNode ? ' input-wrapper-locked' : ''}`}>
         <div className="input-textarea-clip">
           <textarea
             ref={textareaRef}
             value={input}
-            onChange={e => setInput(e.target.value)}
+            onChange={e => {
+              if (isChildProgressionNode) return;
+              setInput(e.target.value);
+            }}
             onKeyDown={e => {
+              if (isChildProgressionNode) return;
               if (e.key === 'Enter' && !e.shiftKey) {
                 // 跳过输入法（IME）组合态中的 Enter —— 用户还在选字
                 if (e.nativeEvent.isComposing) return;
@@ -573,12 +595,12 @@ export default function InputBar() {
               }
             }}
             placeholder={getPlaceholder()}
-            disabled={sendingMessage}
+            disabled={sendingMessage || isChildProgressionNode}
             rows={1}
           />
         </div>
 
-        {imageAttachment && (
+        {!isChildProgressionNode && imageAttachment && (
           <div className="input-attachment-preview">
             <img src={imageAttachment.data_url} alt="" />
             <div className="input-attachment-info">
@@ -596,7 +618,7 @@ export default function InputBar() {
           </div>
         )}
 
-        {documentAttachment && (
+        {!isChildProgressionNode && documentAttachment && (
           <div className="input-attachment-preview document-attachment-preview">
             <span className="input-attachment-doc-icon">
               {documentAttachment.kind === 'pdf_url' ? <Link2 size={18} /> : <FileUp size={18} />}
@@ -620,7 +642,7 @@ export default function InputBar() {
           </div>
         )}
 
-        <div className="input-toolbar">
+        {!isChildProgressionNode && <div className="input-toolbar">
           {/* 模型选择 */}
           <div
             className={`model-pills${thinkingPopoverFor ? ' has-thinking-popover' : ''}`}
@@ -880,9 +902,9 @@ export default function InputBar() {
               <ArrowUp size={18} />
             </button>
           </div>
-        </div>
+        </div>}
 
-        {uploadFormOpen && (
+        {!isChildProgressionNode && uploadFormOpen && (
           <div
             className="upload-form-backdrop"
             onMouseDown={(e) => {

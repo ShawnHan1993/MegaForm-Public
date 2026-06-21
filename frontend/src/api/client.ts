@@ -261,7 +261,6 @@ export async function importPdfStream(
     method: 'POST',
     headers: {
       'Content-Type': 'application/pdf',
-      'X-Filename': data.file.name,
     },
     credentials: 'same-origin',
     body: data.file,
@@ -424,7 +423,6 @@ export async function importMarkdownStream(
     method: 'POST',
     headers: {
       'Content-Type': 'text/markdown; charset=utf-8',
-      'X-Filename': data.file.name,
     },
     credentials: 'same-origin',
     body: data.file,
@@ -769,7 +767,7 @@ export const api = {
     }),
   /** 删除节点（V3: 如果删除的是问题根节点，后端返回 deleted_root=true） */
   deleteNode: (nodeId: string) =>
-    request<{ status: string; deleted_root?: boolean; root_id?: string; deleted_count?: number }>(`/nodes/${nodeId}`, { method: 'DELETE' }),
+    request<{ status: string; deleted_root?: boolean; root_id?: string; deleted_count?: number; deleted_ids?: string[] }>(`/nodes/${nodeId}`, { method: 'DELETE' }),
   /** 折叠/展开节点，可选传入 AI 摘要 */
   collapseNode: (nodeId: string, collapsed: boolean, summary?: string) =>
     request<{ status: string }>(`/nodes/${nodeId}/collapse`, {
@@ -880,6 +878,14 @@ export const api = {
     request<{ status: string }>('/settings', {
       method: 'POST',
       body: JSON.stringify(data),
+    }),
+  /** 获取最近访问节点 */
+  getRecentNodes: () => request<{ nodes: Node[]; node_ids: string[] }>('/recent-nodes'),
+  /** 保存最近访问节点 ID 列表 */
+  saveRecentNodes: (nodeIds: string[]) =>
+    request<{ status: string; node_ids: string[] }>('/recent-nodes', {
+      method: 'PUT',
+      body: JSON.stringify({ node_ids: nodeIds }),
     }),
 
   // User profile

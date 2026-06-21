@@ -8,6 +8,7 @@ MegaForm turns the traditional linear Q&A into an expandable, collapsible, deep-
 
 ![Main Page](screenshot.png)
 ![Conversation Tree](screenshot2.png)
+![Conversation Overview](screenshot3.png)
 
 ---
 

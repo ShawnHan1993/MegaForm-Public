@@ -12,13 +12,17 @@
  */
 import React, { useEffect, useLayoutEffect, useState, useRef, useCallback } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { ListChevronsDownUp } from 'lucide-react';
+import { GitBranch, ListChevronsDownUp, MessageSquare } from 'lucide-react';
 import { useAppStore } from '../store/appStore';
 import NodeCard from './NodeCard';
+import TreeOverview, { TreeOverviewMiniMap } from './TreeOverview';
 import FrozenModelBar, { type FrozenEntry } from './FrozenModelBar';
 import MarkdownContent from './MarkdownContent';
+import ReferencePreview from './ReferencePreview';
 import type { Node, Nut } from '../types';
 import { useT } from '../i18n';
+import { getNutReferenceText } from '../utils/referenceText';
+import { useMiniMapEnabled } from '../utils/uiPreferences';
 
 const FREEZE_ENTER_OFFSET = 8;
 const FREEZE_EXIT_OFFSET = 2;
@@ -77,6 +81,7 @@ const cameraPanStyle = (cameraPan: CameraPan): React.CSSProperties => ({
 
 export default function ChatArea() {
   const t = useT();
+  const miniMapEnabled = useMiniMapEnabled();
   const rootTree = useAppStore(s => s.rootTree);
   const focusedNodeId = useAppStore(s => s.focusedNodeId);
   const getNodePath = useAppStore(s => s.getNodePath);
@@ -106,9 +111,12 @@ export default function ChatArea() {
   const clearScrollToNodeId = useAppStore(s => s.clearScrollToNodeId);
   const searchScrollTarget = useAppStore(s => s.searchScrollTarget);
   const clearSearchScrollTarget = useAppStore(s => s.clearSearchScrollTarget);
+  const [overviewMode, setOverviewMode] = useState(false);
 
   // ── 冻结区状态 ──
   const [frozenEntries, setFrozenEntries] = useState<FrozenEntry[]>([]);
+  const [frozenStackDepth, setFrozenStackDepth] = useState(0);
+  const [frozenExitMode, setFrozenExitMode] = useState<'none' | 'pop-out'>('none');
 
   // ── 移动端面包屑自动显隐 ──
   const [breadcrumbVisible, setBreadcrumbVisible] = useState(true);
@@ -136,6 +144,8 @@ export default function ChatArea() {
   const activeFrozenViewIdRef = useRef<string | null>(focusedNodeId);
   const clearFrozenStack = useCallback(() => {
     setFrozenEntries([]);
+    setFrozenStackDepth(0);
+    setFrozenExitMode('none');
     prevFrozenNodeIdsRef.current = new Set();
     frozenStackRef.current = [];
     flipCapturesRef.current = {};
@@ -212,7 +222,8 @@ export default function ChatArea() {
     const nodeMap = nodeMapRef.current;
     const containerRect = chatArea.getBoundingClientRect();
     const freezeLineY = BREADCRUMB_FIXED_HEIGHT;
-    const previousStackIds = new Set(frozenStackRef.current.map(entry => entry.nodeId));
+    const previousStack = frozenStackRef.current;
+    const previousStackIds = new Set(previousStack.map(entry => entry.nodeId));
 
     // 按 DOM 顺序遍历（即树的前序遍历）。聚焦切换动画期间旧视图仍会短暂留在 DOM，
     // 只读取当前聚焦视图里的锚点，避免旧父节点冻结区被滚动回调重新算回来。
@@ -281,8 +292,11 @@ export default function ChatArea() {
     });
 
     const topEntry = stack.length > 0 ? [stack[stack.length - 1]] : [];
+    const nextExitMode = stack.length < previousStack.length ? 'pop-out' : 'none';
     frozenStackRef.current = stack;
     prevFrozenNodeIdsRef.current = new Set(topEntry.map(e => e.nodeId));
+    setFrozenStackDepth(prev => prev === stack.length ? prev : stack.length);
+    setFrozenExitMode(prev => prev === nextExitMode ? prev : nextExitMode);
     setFrozenEntries(prev => {
       if (JSON.stringify(prev) === JSON.stringify(topEntry)) return prev;
       return topEntry;
@@ -293,18 +307,19 @@ export default function ChatArea() {
   useEffect(() => {
     const chatArea = chatAreaRef.current;
     if (!chatArea) return;
-    let lastRun = 0;
-    const THROTTLE = 100; // ms
+    let rafId: number | null = null;
     const onScroll = () => {
-      const now = Date.now();
-      if (now - lastRun < THROTTLE) return;
-      lastRun = now;
-      handleChatScroll();
+      if (rafId !== null) return;
+      rafId = requestAnimationFrame(() => {
+        rafId = null;
+        handleChatScroll();
+      });
     };
     chatArea.addEventListener('scroll', onScroll, { passive: true });
     chatArea.addEventListener('touchmove', onScroll, { passive: true });
     handleChatScroll(); // 初始检测
     return () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
       chatArea.removeEventListener('scroll', onScroll);
       chatArea.removeEventListener('touchmove', onScroll);
     };
@@ -352,7 +367,7 @@ export default function ChatArea() {
     for (const resp of parent.responses) {
       if (resp.nuts) {
         const nut = resp.nuts.find((n: Nut) => n.id === node.nut_id);
-        if (nut?.label) return nut.label;
+        if (nut) return getNutReferenceText(resp.content, nut, nut.label || '');
       }
     }
     return null;
@@ -868,6 +883,49 @@ export default function ChatArea() {
     curStreamRelation === 'followup' || !rootTree || rootTree.length === 0
   );
 
+  const handleOverviewSelectNode = useCallback((node: Node) => {
+    setOverviewMode(false);
+    focusBreadcrumbNode(
+      node.id,
+      null,
+      node.parent_id ? '/node/' + node.id : '/root/' + node.root_id,
+    );
+  }, [focusBreadcrumbNode]);
+
+  const handleMiniMapSelectNode = useCallback((node: Node) => {
+    if (node.id === focusedNodeId) {
+      setChatAreaScrollTopInstant(0);
+      return;
+    }
+
+    const targetPath = getNodePath(node.id).map(item => item.id);
+    const isInFocusedSubtree = Boolean(
+      focusedNodeId &&
+      targetPath.includes(focusedNodeId) &&
+      targetPath[targetPath.length - 1] === node.id,
+    );
+    const targetCard = chatAreaRef.current?.querySelector<HTMLElement>(
+      `[data-scroll-anchor="${node.id}"]`
+    );
+    if (isInFocusedSubtree && targetCard) {
+      scrollElementToSafeTop(targetCard, { reserveFrozen: true });
+      return;
+    }
+
+    const currentPath = focusedNodeId ? getNodePath(focusedNodeId).map(item => item.id) : [];
+    const isAncestorJump = Boolean(
+      focusedNodeId &&
+      targetPath.length < currentPath.length &&
+      targetPath.every((id, index) => currentPath[index] === id),
+    );
+
+    focusBreadcrumbNode(
+      node.id,
+      isAncestorJump ? focusedNodeId : null,
+      node.parent_id ? '/node/' + node.id : '/root/' + node.root_id,
+    );
+  }, [focusBreadcrumbNode, focusedNodeId, getNodePath, scrollElementToSafeTop, setChatAreaScrollTopInstant]);
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: '1', minHeight: 0 }}>
       {/* Inner wrapper: 面包屑 + 冻结区悬浮在 chat-area 上方，不挤占布局 */}
@@ -916,9 +974,7 @@ export default function ChatArea() {
               >
                 {isFollowup && quote ? (
                   <>
-                    <span className="followup-quote">
-                      <MarkdownContent content={formatBreadcrumbText(quote)} inline />
-                    </span>
+                    <span className="followup-quote"><ReferencePreview text={quote} /></span>
                     <span className="followup-question">{formatBreadcrumbText(getBreadcrumbText(node))}</span>
                   </>
                 ) : (
@@ -929,25 +985,39 @@ export default function ChatArea() {
           );
         })}
 
-        {/* 折叠全部按钮（仅折叠，不提供展开） */}
         {currentRootId && rootTree && rootTree.length > 0 && (
-          <button
-            className={`collapse-all-btn${allNodesCollapsed ? ' is-disabled' : ''}`}
-            onClick={allNodesCollapsed ? undefined : collapseAll}
-            title={t('collapseAllNodes')}
-            disabled={allNodesCollapsed}
-          >
-            <ListChevronsDownUp size={18} />
-          </button>
+          <span className="breadcrumb-actions">
+            <button
+              className={`collapse-all-btn overview-toggle-btn${overviewMode ? ' is-active' : ''}`}
+              onClick={() => {
+                clearFrozenStack();
+                setOverviewMode(value => !value);
+              }}
+              title={overviewMode ? t('readingMode') : t('overviewMode')}
+            >
+              {overviewMode ? <MessageSquare size={18} /> : <GitBranch size={18} />}
+            </button>
+            {/* 折叠全部按钮（仅折叠，不提供展开） */}
+            <button
+              className={`collapse-all-btn${allNodesCollapsed ? ' is-disabled' : ''}`}
+              onClick={allNodesCollapsed ? undefined : collapseAll}
+              title={t('collapseAllNodes')}
+              disabled={allNodesCollapsed || overviewMode}
+            >
+              <ListChevronsDownUp size={18} />
+            </button>
+          </span>
         )}
       </div>
       </div>
 
       <FrozenModelBar
         entries={frozenEntries}
+        stackDepth={frozenStackDepth}
+        exitMode={frozenExitMode}
         flipCapturesRef={flipCapturesRef}
         top={BREADCRUMB_FIXED_HEIGHT}
-        visible={breadcrumbVisible}
+        visible={(isMobile ? breadcrumbVisible : true) && !overviewMode}
         onSelectModel={(nodeId, modelId) => {
           const chatArea = chatAreaRef.current;
           if (!chatArea) return;
@@ -963,12 +1033,22 @@ export default function ChatArea() {
         }}
       />
 
+      {miniMapEnabled && !isMobile && !overviewMode && rootTree && rootTree.length > 0 && (
+        <TreeOverviewMiniMap
+          rootTree={rootTree}
+          focusedNodeId={focusedNodeId}
+          stackHighlightNodeId={frozenEntries[0]?.nodeId || null}
+          streamingNodeIds={streamingNodeIds}
+          onSelectNode={handleMiniMapSelectNode}
+        />
+      )}
+
       {/* Chat content — 带 Workflowy 式下钻/返回动画 */}
       <div
         ref={chatAreaRef}
-        className={`chat-area${isDrillCommitSwapping ? ' is-drill-commit-swapping' : ''}`}
+        className={`chat-area${overviewMode ? ' is-overview-mode' : ''}${isDrillCommitSwapping ? ' is-drill-commit-swapping' : ''}`}
         style={{
-          paddingTop: `${CHAT_AREA_FIXED_TOP_PADDING}px`,
+          paddingTop: overviewMode ? 0 : `${CHAT_AREA_FIXED_TOP_PADDING}px`,
         }}
       >
         {showStreamingPlaceholder ? (
@@ -1001,6 +1081,13 @@ export default function ChatArea() {
           <div className="empty-state">
             <p>{t('loadingTree')}</p>
           </div>
+        ) : overviewMode && rootTree && rootTree.length > 0 ? (
+          <TreeOverview
+            rootTree={rootTree}
+            focusedNodeId={focusedNodeId}
+            streamingNodeIds={streamingNodeIds}
+            onSelectNode={handleOverviewSelectNode}
+          />
         ) : focusedNode ? (
           <AnimatePresence
             initial={false}
@@ -1038,7 +1125,7 @@ export default function ChatArea() {
           </div>
         )}
         {/* 底部空白区：保证最后一个卡片能 scroll 到顶部 */}
-        <div className="chat-area-spacer" />
+        {!overviewMode && <div className="chat-area-spacer" />}
       </div>
       </div>
     </div>

@@ -12,9 +12,7 @@ from app_state import (
     _get_summary_model_id,
     _get_user_id,
     _get_user_language,
-    _mark_root_summary_dirty,
     _mark_root_summary_dirty_if_shallow_node,
-    _node_depth_from_root,
     _should_use_profile,
     _summary_changed_enough,
     asyncio,
@@ -316,24 +314,22 @@ def delete_node_api(node_id: str, request: Request):
     node = db.get_node(node_id, user_id=user_id)
     if not node:
         return JSONResponse({"error": "节点不存在"}, status_code=404)
-    depth = _node_depth_from_root(node_id, user_id=user_id)
-
     if node.get("parent_id") is None:
         root_id = node["root_id"]
+        deleted_ids = [root_node["id"] for root_node in db.get_root_nodes(root_id, user_id=user_id)]
         response_ids = []
         for root_node in db.get_root_nodes(root_id, user_id=user_id):
             response_ids.extend(r["id"] for r in db.get_node_responses(root_node["id"], user_id=user_id))
         log.info("node: 删除根节点 root=%s", root_id)
         db.delete_root(root_id, user_id=user_id)
         _remove_mineru_response_assets_many(user_id, response_ids)
-        return JSONResponse({"status": "ok", "deleted_root": True, "root_id": root_id})
+        return JSONResponse({"status": "ok", "deleted_root": True, "root_id": root_id, "deleted_ids": deleted_ids})
 
+    deleted_ids = db.get_subtree_node_ids(node_id, user_id=user_id)
     response_ids = _collect_node_response_ids(node_id, user_id=user_id)
     count = db.delete_subtree(node_id, user_id=user_id)
     _remove_mineru_response_assets_many(user_id, response_ids)
-    if depth is not None and depth <= 1:
-        _mark_root_summary_dirty(node["root_id"], user_id=user_id)
-    return JSONResponse({"status": "ok", "deleted_count": count})
+    return JSONResponse({"status": "ok", "deleted_count": count, "deleted_ids": deleted_ids})
 
 
 # ── 节点折叠/摘要 ──
@@ -397,12 +393,14 @@ async def generate_summary(node_id: str, request: Request):
     if _get_user_language(user_id) == "en":
         prompt = (
             "Summarize the core topic of the following user question in English. "
-            "Requirements: within 25 tokens; no quotes; no final period; output only the summary:\n\n"
+            "Use only this question text. Ignore child nodes, answers, and any other context. "
+            "Requirements: within 25 tokens; output a complete phrase; no quotes; no final period; output only the summary:\n\n"
             f"{content[:2000]}"
         )
     else:
         prompt = (
-            "请用中文概括以下用户问题的核心内容。要求：25个token以内；"
+            "请用中文概括以下用户问题的核心内容。只根据这段问题原文生成，"
+            "不要参考子节点、回答或任何其他上下文。要求：25个token以内；语义完整；"
             "不要加引号、不要加句号；直接输出摘要：\n\n"
             f"{content[:2000]}"
         )

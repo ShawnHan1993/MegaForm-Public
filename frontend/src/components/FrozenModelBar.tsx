@@ -7,7 +7,8 @@
  * 
  * FLIP 动画：新冻结行的芯片从原 model-bar 位置平滑飞入。
  */
-import { useEffect, useMemo, useRef } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { AnimatePresence, motion } from 'framer-motion';
 import { useAppStore } from '../store/appStore';
 import { useT } from '../i18n';
 
@@ -26,6 +27,10 @@ export type FlipCaptures = Record<string, Record<string, DOMRect>>;
 
 interface Props {
   entries: FrozenEntry[];
+  /** 当前冻结栈深度，用于区分入栈/出栈动画 */
+  stackDepth?: number;
+  /** 栈顶离场模式 */
+  exitMode?: 'none' | 'pop-out';
   /** 选择模型后自动滚动到对应回复顶部 */
   onSelectModel?: (nodeId: string, modelId: string) => void;
   /** FLIP 动画的 First-position 捕获数据 ref */
@@ -38,17 +43,51 @@ interface Props {
 
 const FLIP_DURATION = '0.28s';
 const FLIP_EASING = 'cubic-bezier(0.16, 1, 0.3, 1)';
+const ROW_EXIT_X = 96;
+const ROW_POP_OUT_DURATION = 0.42;
+const ROW_EXIT_EASE: [number, number, number, number] = [0.16, 1, 0.3, 1];
+const rowVariants = {
+  animate: {
+    opacity: 1,
+    x: 0,
+  },
+  exit: (mode: 'none' | 'pop-out') => ({
+    opacity: 0,
+    x: mode === 'pop-out' ? ROW_EXIT_X : 0,
+    transition: {
+      duration: mode === 'pop-out' ? ROW_POP_OUT_DURATION : 0.08,
+      ease: ROW_EXIT_EASE,
+    },
+  }),
+};
 
-export default function FrozenModelBar({ entries, onSelectModel, flipCapturesRef, top, visible = true }: Props) {
+export default function FrozenModelBar({
+  entries,
+  stackDepth = entries.length,
+  exitMode = 'none',
+  onSelectModel,
+  flipCapturesRef,
+  top,
+  visible = true,
+}: Props) {
   const t = useT();
   const models = useAppStore(s => s.models);
   const activeModelId = useAppStore(s => s.activeModelId);
   const setActiveModelId = useAppStore(s => s.setActiveModelId);
   const focusNode = useAppStore(s => s.focusNode);
+  const [shellActive, setShellActive] = useState(entries.length > 0);
   const visibleEntries = useMemo(
     () => entries.length > 0 ? [entries[entries.length - 1]] : [],
     [entries]
   );
+
+  useEffect(() => {
+    if (entries.length > 0) {
+      setShellActive(true);
+    } else if (exitMode !== 'pop-out') {
+      setShellActive(false);
+    }
+  }, [entries.length, exitMode, stackDepth]);
 
   // ── FLIP 动画：新冻结行从原始 model-bar 位置飞入 ──
   useEffect(() => {
@@ -108,10 +147,18 @@ export default function FrozenModelBar({ entries, onSelectModel, flipCapturesRef
 
   return (
     <div
-      className={`frozen-bar-shell${entries.length > 0 ? ' has-entries' : ''}${visible ? '' : ' hidden'}`}
+      className={`frozen-bar-shell${shellActive ? ' has-entries' : ''}${visible ? '' : ' hidden'}`}
       style={top != null ? { top } : undefined}
     >
       <div className="frozen-model-bar">
+        <AnimatePresence
+          initial={false}
+          mode="popLayout"
+          custom={exitMode}
+          onExitComplete={() => {
+            if (visibleEntries.length === 0) setShellActive(false);
+          }}
+        >
         {visibleEntries.map((entry) => {
           const sortedModelIds = [...entry.modelIds].sort((a, b) => {
             const aDeleted = isDeletedModel(a);
@@ -120,7 +167,16 @@ export default function FrozenModelBar({ entries, onSelectModel, flipCapturesRef
             return 0;
           });
           return (
-          <div key={entry.nodeId} className="frozen-row" data-frozen-row={entry.nodeId}>
+          <motion.div
+            key={entry.nodeId}
+            className="frozen-row"
+            data-frozen-row={entry.nodeId}
+            custom={exitMode}
+            variants={rowVariants}
+            initial={false}
+            animate="animate"
+            exit="exit"
+          >
           {/* 节点标识：问题摘要（可点击跳转） */}
           {/* <span
             className="frozen-row-label"
@@ -152,9 +208,10 @@ export default function FrozenModelBar({ entries, onSelectModel, flipCapturesRef
               );
             })}
           </span>
-        </div>
+        </motion.div>
         );
       })}
+        </AnimatePresence>
     </div>
   </div>
   );

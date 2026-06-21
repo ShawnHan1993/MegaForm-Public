@@ -6,9 +6,20 @@ import { api, chatStream, reconnectChatStream, rerunNodeStream, streamRootTree, 
 import type { Root, RootGroup, Node, Response as Resp, ModelConfig, StreamingResponse, Nut } from '../types';
 import { getLanguage, tr } from '../i18n';
 import type { ImageAttachment } from '../utils/multimodal';
+import { getNutReferenceText } from '../utils/referenceText';
 
 // ── localStorage 持久化：折叠状态 ──
 const LS_COLLAPSED_PREFIX = 'megaform-collapsed-';
+const RECENT_NODE_LIMIT = 10;
+const RECENT_NODE_UPDATE_DELAY_MS = 1000;
+const AUTO_COLLAPSE_NODE_THRESHOLD = 120;
+const recentNodeUpdateTimers = new Map<string, number>();
+
+function hasCollapsedSetPreference(rootId: string): boolean {
+  try {
+    return localStorage.getItem(LS_COLLAPSED_PREFIX + rootId) !== null;
+  } catch { return false; }
+}
 
 function loadCollapsedSet(rootId: string): Set<string> {
   try {
@@ -84,6 +95,54 @@ function canCollapseNode(node: Node): boolean {
   return isLogicalNode(node)
     || !!(node.children && node.children.length > 0)
     || !!(node.responses && node.responses.length > 0);
+}
+
+function countNodeDescendants(node: Node): number {
+  const children = node.children || [];
+  return children.reduce((sum, child) => sum + 1 + countNodeDescendants(child), 0);
+}
+
+function countTreeNodes(nodes: Node[]): number {
+  let count = 0;
+  const walk = (list: Node[]) => {
+    for (const node of list) {
+      count += 1;
+      if (node.children?.length) walk(node.children);
+    }
+  };
+  walk(nodes);
+  return count;
+}
+
+function getAutoCollapsedSetForLargeTree(nodes: Node[]): Set<string> {
+  const ids = new Set<string>();
+  const walk = (list: Node[], depth: number) => {
+    for (const node of list) {
+      if (depth >= 1 && canCollapseNode(node)) ids.add(node.id);
+      if (node.children?.length) walk(node.children, depth + 1);
+    }
+  };
+  walk(nodes, 0);
+  return ids;
+}
+
+function getFollowupQuoteForNode(node: Node, lookup: (id: string) => Node | null): string | null {
+  if (node.relation !== 'followup' || !node.nut_id || !node.parent_id) return node.followup_quote || null;
+  const parent = lookup(node.parent_id);
+  if (!parent?.responses) return node.followup_quote || null;
+  for (const response of parent.responses) {
+    const nut = response.nuts?.find(n => n.id === node.nut_id);
+    if (nut) return getNutReferenceText(response.content, nut, nut.label || node.followup_quote || '');
+  }
+  return node.followup_quote || null;
+}
+
+function clearRecentNodeTimers(nodeIds: Iterable<string>) {
+  for (const nodeId of nodeIds) {
+    const timer = recentNodeUpdateTimers.get(nodeId);
+    if (timer) window.clearTimeout(timer);
+    recentNodeUpdateTimers.delete(nodeId);
+  }
 }
 
 /**
@@ -179,6 +238,58 @@ function hasNodeStreamingResponses(
 ): boolean {
   const prefix = nodeId + ':';
   return Object.keys(streamingResponses).some(key => key.startsWith(prefix));
+}
+
+type StoreSet = (
+  partial: Partial<AppState> | AppState | ((state: AppState) => Partial<AppState> | AppState),
+  replace?: false,
+) => void;
+
+const STREAMING_FLUSH_MS = 80;
+const pendingStreamingDeltas = new Map<string, { thinking: string; content: string; status: 'thinking' | 'responding' }>();
+let streamingFlushTimer: number | null = null;
+
+function flushStreamingDeltas(set: StoreSet) {
+  if (streamingFlushTimer !== null) {
+    window.clearTimeout(streamingFlushTimer);
+    streamingFlushTimer = null;
+  }
+  if (pendingStreamingDeltas.size === 0) return;
+
+  const deltas = new Map(pendingStreamingDeltas);
+  pendingStreamingDeltas.clear();
+
+  set(state => {
+    let changed = false;
+    const streamingResponses = { ...state.streamingResponses };
+    for (const [key, delta] of deltas) {
+      const resp = streamingResponses[key];
+      if (!resp) continue;
+      changed = true;
+      streamingResponses[key] = {
+        ...resp,
+        thinking: resp.thinking + delta.thinking,
+        content: resp.content + delta.content,
+        status: delta.status,
+      };
+    }
+    return changed ? { streamingResponses } : {};
+  });
+}
+
+function queueStreamingDelta(
+  set: StoreSet,
+  key: string,
+  delta: { thinking?: string; content?: string; status: 'thinking' | 'responding' },
+) {
+  const pending = pendingStreamingDeltas.get(key) || { thinking: '', content: '', status: delta.status };
+  pending.thinking += delta.thinking || '';
+  pending.content += delta.content || '';
+  pending.status = delta.status === 'responding' ? 'responding' : pending.status;
+  pendingStreamingDeltas.set(key, pending);
+
+  if (streamingFlushTimer !== null) return;
+  streamingFlushTimer = window.setTimeout(() => flushStreamingDeltas(set), STREAMING_FLUSH_MS);
 }
 
 function mergeResponsesByModel(existing: any[] | undefined, incoming: any[]): any[] {
@@ -278,6 +389,16 @@ function patchRootSummary(roots: Root[], nodeId: string, summary: string): { roo
   return { roots: nextRoots, patched };
 }
 
+function patchRecentNodeSummary(recentNodes: Node[], nodeId: string, summary: string): { recentNodes: Node[]; patched: boolean } {
+  let patched = false;
+  const nextRecentNodes = recentNodes.map(node => {
+    if (node.id !== nodeId) return node;
+    patched = true;
+    return { ...node, summary };
+  });
+  return { recentNodes: nextRecentNodes, patched };
+}
+
 export interface AppState {
   // ── 问题 ──
   /** 问题树列表（按更新时间倒序排列） */
@@ -288,6 +409,8 @@ export interface AppState {
   currentRootId: string | null;
   /** 当前问题树的树形结构（null 表示未加载） */
   rootTree: Node[] | null;
+  /** 最近访问过的节点，按访问时间倒序 */
+  recentNodes: Node[];
 
   // ── 聚焦 ──
   /** 当前聚焦（高亮/居中）的节点 ID */
@@ -371,13 +494,17 @@ export interface AppState {
   deleteRootGroup: (groupId: string) => Promise<void>;
   /** 移动 root 到分组，不改变对话更新时间 */
   moveRootToGroup: (rootId: string, groupId: string | null) => Promise<void>;
+  /** 获取最近访问过的节点 */
+  fetchRecentNodes: () => Promise<void>;
+  /** 记录最近访问节点：本地实时更新，异步持久化 */
+  markRecentNode: (nodeId: string) => void;
   /** 清除 scrollToNodeId（滚动完成后由 ChatArea 调用） */
   clearScrollToNodeId: () => void;
   /** 设置/清除搜索结果定位目标 */
   setSearchScrollTarget: (target: Omit<NonNullable<AppState['searchScrollTarget']>, 'requestId'> | null) => void;
   clearSearchScrollTarget: () => void;
   /** 打开问题树（SSE 流式加载树，5 秒超时回退到 REST API） */
-  openRoot: (rootId: string) => Promise<void>;
+  openRoot: (rootId: string, opts?: { markRecent?: boolean }) => Promise<void>;
   /** 删除问题树（从列表移除；若当前问题树被删则回到 empty-state） */
   deleteRoot: (rootId: string) => Promise<void>;
   /** 聚焦节点（设置 focusedNodeId） */
@@ -408,6 +535,8 @@ export interface AppState {
     parentId?: string;
     nutId?: string;
     partialContent?: string;
+    followupSeek?: number;
+    followupEndSeek?: number;
     webSearch?: boolean;
     useProfile?: boolean;
     parentModelId?: string;
@@ -523,6 +652,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   rootGroups: [],
   currentRootId: null,
   rootTree: null,
+  recentNodes: [],
   focusedNodeId: null,
   models: [],
   selectedModelIds: [],
@@ -588,6 +718,50 @@ export const useAppStore = create<AppState>((set, get) => ({
     set({ roots });
   },
 
+  fetchRecentNodes: async () => {
+    const result = await api.getRecentNodes();
+    set({ recentNodes: result.nodes || [] });
+  },
+
+  markRecentNode: (nodeId: string) => {
+    const markedAt = Date.now();
+    const commit = (node: Node) => {
+      const remainingDelay = Math.max(0, RECENT_NODE_UPDATE_DELAY_MS - (Date.now() - markedAt));
+      const existingTimer = recentNodeUpdateTimers.get(node.id);
+      if (existingTimer) window.clearTimeout(existingTimer);
+
+      const timer = window.setTimeout(() => {
+        recentNodeUpdateTimers.delete(node.id);
+        set(state => {
+          const childCount = typeof node.child_count === 'number'
+            ? node.child_count
+            : countNodeDescendants(node);
+          const followupQuote = getFollowupQuoteForNode(node, id => get().getNodeById(id) || get().nodeCache[id] || null);
+          const recentNode = { ...node, child_count: childCount, followup_quote: followupQuote };
+          const recentNodes = [
+            recentNode,
+            ...state.recentNodes.filter(n => n.id !== node.id),
+          ].slice(0, RECENT_NODE_LIMIT);
+          api.saveRecentNodes(recentNodes.map(n => n.id)).catch(err => {
+            console.error('[recent-nodes] save failed:', err);
+          });
+          return { recentNodes };
+        });
+      }, remainingDelay);
+      recentNodeUpdateTimers.set(node.id, timer);
+    };
+
+    const node = get().getNodeById(nodeId) || get().nodeCache[nodeId];
+    if (node) {
+      commit(node);
+      return;
+    }
+
+    api.getNode(nodeId)
+      .then(commit)
+      .catch(err => console.error('[recent-nodes] load node failed:', err));
+  },
+
   clearScrollToNodeId: () => set({ scrollToNodeId: null }),
   setSearchScrollTarget: (target) => set({
     searchScrollTarget: target ? { ...target, requestId: Date.now() } : null,
@@ -597,7 +771,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   /**
    * 打开问题树，实现 SSE 流式加载 + 5 秒超时 REST 回退
    */
-  openRoot: async (rootId: string) => {
+  openRoot: async (rootId: string, opts = {}) => {
+    const shouldMarkRecent = opts.markRecent !== false;
+    const hasCollapsePreference = hasCollapsedSetPreference(rootId);
     set({ loading: true, treeLoading: true });
     try {
       let rootReceived = false;
@@ -613,6 +789,9 @@ export const useAppStore = create<AppState>((set, get) => ({
             // 填充 nodeCache
             const cache = { ...get().nodeCache };
             if (root) _populateCache(cache, root);
+            const collapsedSet = !hasCollapsePreference && countTreeNodes(tree) > AUTO_COLLAPSE_NODE_THRESHOLD
+              ? getAutoCollapsedSetForLargeTree(tree)
+              : loadCollapsedSet(rootId);
 
             set({
               currentRootId: rootId,
@@ -620,11 +799,12 @@ export const useAppStore = create<AppState>((set, get) => ({
               focusedNodeId: root?.id || null,
               loading: false,
               treeLoading: false,
-              collapsedSet: loadCollapsedSet(rootId),
+              collapsedSet,
               immersiveHiddenSet: new Set(),
               nodeCache: cache,
             });
             _checkAndResumeStreaming(get());
+            if (root && shouldMarkRecent) get().markRecentNode(root.id);
           } catch (e) {
             console.error('[openRoot] REST 回退也失败:', e);
             set({ loading: false, treeLoading: false });
@@ -648,6 +828,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             loading: false,
             nodeCache: cache,
           });
+          if (shouldMarkRecent) get().markRecentNode(root.id);
         },
         onNode: (node) => {
           set(state => {
@@ -677,7 +858,20 @@ export const useAppStore = create<AppState>((set, get) => ({
         },
         onDone: () => {
           clearTimeout(fallbackTimer);
-          set({ treeLoading: false });
+          set(state => {
+            if (
+              !hasCollapsePreference &&
+              state.rootTree &&
+              state.collapsedSet.size === 0 &&
+              countTreeNodes(state.rootTree) > AUTO_COLLAPSE_NODE_THRESHOLD
+            ) {
+              return {
+                treeLoading: false,
+                collapsedSet: getAutoCollapsedSetForLargeTree(state.rootTree),
+              };
+            }
+            return { treeLoading: false };
+          });
           _checkAndResumeStreaming(get());
         },
         onError: (err) => {
@@ -689,17 +883,21 @@ export const useAppStore = create<AppState>((set, get) => ({
               const tree = root ? [root] : [];
               const cache = { ...get().nodeCache };
               if (root) _populateCache(cache, root);
+              const collapsedSet = !hasCollapsePreference && countTreeNodes(tree) > AUTO_COLLAPSE_NODE_THRESHOLD
+                ? getAutoCollapsedSetForLargeTree(tree)
+                : loadCollapsedSet(rootId);
               set({
                 currentRootId: rootId,
                 rootTree: tree,
                 focusedNodeId: root?.id || null,
                 loading: false,
                 treeLoading: false,
-                collapsedSet: loadCollapsedSet(rootId),
+                collapsedSet,
                 immersiveHiddenSet: new Set(),
                 nodeCache: cache,
               });
               _checkAndResumeStreaming(get());
+              if (root) get().markRecentNode(root.id);
             }).catch(() => {
               set({ loading: false, treeLoading: false, error: err });
             });
@@ -722,6 +920,19 @@ export const useAppStore = create<AppState>((set, get) => ({
       currentRootId: state.currentRootId === rootId ? null : state.currentRootId,
       rootTree: state.currentRootId === rootId ? null : state.rootTree,
       focusedNodeId: state.currentRootId === rootId ? null : state.focusedNodeId,
+      recentNodes: (() => {
+        const removedIds = state.recentNodes
+          .filter(n => n.id === rootId || n.root_id === rootId)
+          .map(n => n.id);
+        clearRecentNodeTimers([rootId, ...removedIds]);
+        const recentNodes = state.recentNodes.filter(n => n.id !== rootId && n.root_id !== rootId);
+        if (recentNodes.length !== state.recentNodes.length) {
+          api.saveRecentNodes(recentNodes.map(n => n.id)).catch(err => {
+            console.error('[recent-nodes] save failed:', err);
+          });
+        }
+        return recentNodes;
+      })(),
     }));
   },
 
@@ -733,6 +944,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       saveCollapsedSet(state.currentRootId, collapsedSet);
       return { focusedNodeId: nodeId, collapsedSet };
     });
+    get().markRecentNode(nodeId);
   },
 
   /** 切换节点折叠/展开 */
@@ -853,6 +1065,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         logic_node: isLogicNode,
         nut_id: opts.nutId,
         partial_content: opts.partialContent,
+        followup_seek: opts.followupSeek,
+        followup_end_seek: opts.followupEndSeek,
         web_search: useWebSearch,
         use_profile: useProfile,
         parent_model_id: parentModelId,
@@ -863,9 +1077,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         onNodeCreated: (data) => {
           const nodeId = data.node_id;
           rootId = data.root_id;
+          const relation = opts.relation || 'progression';
           set(prev => {
             const tree = prev.rootTree ? JSON.parse(JSON.stringify(prev.rootTree)) : [];
-            const relation = opts.relation || 'progression';
             patchNutIntoParentResponse(tree, opts.parentId, parentModelId, data.nut || null);
 
             if (opts.parentId) {
@@ -937,6 +1151,10 @@ export const useAppStore = create<AppState>((set, get) => ({
             };
           });
 
+          if (relation === 'followup' || !opts.parentId) {
+            get().markRecentNode(nodeId);
+          }
+
           if (get().summaryAutoEnabled && estimateTextTokens(content) > 30) {
             get().generateNodeSummary(nodeId).catch(e => {
               console.error('[summary] generate node summary failed:', e);
@@ -959,31 +1177,14 @@ export const useAppStore = create<AppState>((set, get) => ({
         },
         onThinking: (data) => {
           const key = srKey(data.node_id, data.model_id);
-          set(state => {
-            const resp = state.streamingResponses[key];
-            if (!resp) return state;
-            return {
-              streamingResponses: {
-                ...state.streamingResponses,
-                [key]: { ...resp, thinking: resp.thinking + data.content, status: 'thinking' },
-              },
-            };
-          });
+          queueStreamingDelta(set, key, { thinking: data.content, status: 'thinking' });
         },
         onContent: (data) => {
           const key = srKey(data.node_id, data.model_id);
-          set(state => {
-            const resp = state.streamingResponses[key];
-            if (!resp) return state;
-            return {
-              streamingResponses: {
-                ...state.streamingResponses,
-                [key]: { ...resp, content: resp.content + data.content, status: 'responding' },
-              },
-            };
-          });
+          queueStreamingDelta(set, key, { content: data.content, status: 'responding' });
         },
         onModelDone: (data) => {
+          flushStreamingDeltas(set);
           const key = srKey(data.node_id, data.model_id);
           set(state => {
             const resp = state.streamingResponses[key];
@@ -1011,6 +1212,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           });
         },
         onModelError: (data) => {
+          flushStreamingDeltas(set);
           const key = srKey(data.node_id, data.model_id);
           set(state => ({
             streamingResponses: {
@@ -1027,6 +1229,7 @@ export const useAppStore = create<AppState>((set, get) => ({
           }));
         },
         onDone: async (data) => {
+          flushStreamingDeltas(set);
           const nodeId = data.node_id || (get().streamingNodeIds.size > 0 ? [...get().streamingNodeIds][0] : null);
           if (nodeId && nodeId.startsWith('pending-')) {
             // wait for onNodeCreated to resolve the real nodeId
@@ -2609,7 +2812,13 @@ export const useAppStore = create<AppState>((set, get) => ({
         nodeCache[nodeId] = { ...nodeCache[nodeId], summary: result.summary };
         patched = true;
       }
-      return patched ? { rootTree, roots: rootPatch.roots, nodeCache } : {};
+
+      const recentPatch = patchRecentNodeSummary(state.recentNodes, nodeId, result.summary);
+      if (recentPatch.patched) patched = true;
+
+      return patched
+        ? { rootTree, roots: rootPatch.roots, nodeCache, recentNodes: recentPatch.recentNodes }
+        : {};
     });
   },
 
@@ -2773,6 +2982,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   deleteNode: async (nodeId: string) => {
     try {
       const result = await api.deleteNode(nodeId);
+      const deletedIds = new Set(result.deleted_ids?.length ? result.deleted_ids : [nodeId]);
+      clearRecentNodeTimers(deletedIds);
+      set(state => {
+        const recentNodes = state.recentNodes.filter(n => !deletedIds.has(n.id));
+        const nodeCache = { ...state.nodeCache };
+        deletedIds.forEach(id => delete nodeCache[id]);
+        if (recentNodes.length !== state.recentNodes.length) {
+          api.saveRecentNodes(recentNodes.map(n => n.id)).catch(err => {
+            console.error('[recent-nodes] save failed:', err);
+          });
+        }
+        return {
+          recentNodes,
+          nodeCache,
+          focusedNodeId: state.focusedNodeId && deletedIds.has(state.focusedNodeId) ? null : state.focusedNodeId,
+        };
+      });
       if (result.deleted_root) {
         set(state => ({
           roots: state.roots.filter(t => t.id !== result.root_id),

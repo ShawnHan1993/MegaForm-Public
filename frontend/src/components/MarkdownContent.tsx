@@ -24,7 +24,7 @@ import type { Nut } from '../types';
 import type { Tokens } from 'marked';
 import { getLanguage, tr } from '../i18n';
 import { useMemo, memo, useEffect, useRef, useCallback, useState } from 'react';
-import { renderLatex } from '../utils/latex';
+import { findLatexRanges, renderLatexToPlaceholders, restoreLatexPlaceholders } from '../utils/latex';
 
 interface Props {
   content: string;
@@ -117,6 +117,13 @@ function escapeAttr(value: string): string {
 }
 
 const markdownRenderer = new Renderer();
+const STREAMING_RENDER_DEBOUNCE_MS = 100;
+let highlightJsPromise: Promise<typeof import('highlight.js/lib/common').default> | null = null;
+
+function loadHighlightJs() {
+  highlightJsPromise ||= import('highlight.js/lib/common').then(({ default: hljs }) => hljs);
+  return highlightJsPromise;
+}
 
 markdownRenderer.code = ({ text, lang, escaped }: Tokens.Code): string => {
   const rawLang = (lang || '').match(/^\S+/)?.[0] || null;
@@ -161,6 +168,29 @@ function nutsEqual(a?: Nut[], b?: Nut[]): boolean {
   return true;
 }
 
+function expandRangeAroundLatex(start: number, end: number, latexRanges: ReturnType<typeof findLatexRanges>): { start: number; end: number } {
+  let expandedStart = start;
+  let expandedEnd = end;
+  let changed = true;
+
+  while (changed) {
+    changed = false;
+    for (const range of latexRanges) {
+      if (expandedStart < range.end && expandedEnd > range.start) {
+        const nextStart = Math.min(expandedStart, range.start);
+        const nextEnd = Math.max(expandedEnd, range.end);
+        if (nextStart !== expandedStart || nextEnd !== expandedEnd) {
+          expandedStart = nextStart;
+          expandedEnd = nextEnd;
+          changed = true;
+        }
+      }
+    }
+  }
+
+  return { start: expandedStart, end: expandedEnd };
+}
+
 // ━━━ MarkdownContent 组件 (React.memo) ━━━
 const MarkdownContent = memo(function MarkdownContent({
   content,
@@ -178,7 +208,7 @@ const MarkdownContent = memo(function MarkdownContent({
   const containerRef = useRef<HTMLDivElement>(null);
 
   // ── 流式渲染策略 ──
-  // 粒度：setTimeout(0) → 几乎逐 token 渲染，但同事件循环内 batched
+  // 粒度：约 100ms 合并渲染，避免长回答逐 token 反复 Markdown/KaTeX parse。
   // 代码块防抖：不通过延迟渲染，而是跳过开放代码块的 highlight.js 高亮
   // 原理：开放代码块以纯文本 <pre><code> 渲染，不做语法高亮 →
   //       DOM 结构稳定（无 hljs 异步 class 注入），不会抖动。
@@ -194,12 +224,10 @@ const MarkdownContent = memo(function MarkdownContent({
       return;
     }
 
-    // 流式模式：setTimeout(0) 不做积攒，同一事件循环内的多个 chunk
-    // 会因 clearTimeout 而只触发一次渲染。chunk 到达间隔 >4ms 则逐次渲染。
     clearTimeout(debounceTimerRef.current);
     debounceTimerRef.current = setTimeout(() => {
       setDebouncedContent(content);
-    }, 0);  // 微任务延迟，不积攒 chunk，但让 React 批量同步
+    }, STREAMING_RENDER_DEBOUNCE_MS);
 
     return () => clearTimeout(debounceTimerRef.current);
   }, [content, streaming]);
@@ -246,12 +274,17 @@ const MarkdownContent = memo(function MarkdownContent({
       }
     }
 
-    allNutsToMark.sort((a, b) => b.nut.seek - a.nut.seek);
+    const latexRanges = findLatexRanges(processedContent);
+    const marks = allNutsToMark
+      .map(({ nut, type }) => {
+        const localSeek = nut.seek - contentOffset;
+        const localEndSeek = nut.end_seek - contentOffset;
+        const expanded = expandRangeAroundLatex(localSeek, localEndSeek, latexRanges);
+        return { nut, type, localSeek: expanded.start, localEndSeek: expanded.end };
+      })
+      .sort((a, b) => b.localSeek - a.localSeek);
 
-    for (const { nut, type } of allNutsToMark) {
-      const localSeek = nut.seek - contentOffset;
-      const localEndSeek = nut.end_seek - contentOffset;
-
+    for (const { nut, type, localSeek, localEndSeek } of marks) {
       if (localSeek < 0 || localEndSeek > processedContent.length || localSeek >= localEndSeek) continue;
 
       const className = type === 'collapsed' ? 'nut-collapsed' : type === 'pending' ? 'nut-pending' : 'nut-highlight';
@@ -267,10 +300,11 @@ const MarkdownContent = memo(function MarkdownContent({
     }
 
     try {
-      const latexRendered = renderLatex(processedContent);
-      return inline
-        ? marked.parseInline(latexRendered, { renderer: markdownRenderer }) as string
-        : marked.parse(latexRendered, { renderer: markdownRenderer }) as string;
+      const latexRendered = renderLatexToPlaceholders(processedContent);
+      const markdownHtml = inline
+        ? marked.parseInline(latexRendered.content, { renderer: markdownRenderer }) as string
+        : marked.parse(latexRendered.content, { renderer: markdownRenderer }) as string;
+      return restoreLatexPlaceholders(markdownHtml, latexRendered.html);
     } catch {
       return inline ? processedContent : `<p>${processedContent}</p>`;
     }
@@ -288,7 +322,7 @@ const MarkdownContent = memo(function MarkdownContent({
     prevHtmlRef.current = html;
 
     // ── highlight.js 语法高亮（仅未高亮且已闭合的 code block） ──
-    import('highlight.js/lib/common').then(({ default: hljs }) => {
+    loadHighlightJs().then(hljs => {
       const codeBlocks = container.querySelectorAll<HTMLElement>('pre code');
 
       // 流式 + 有开放代码块时，跳过最后一个 code block（它正在流式中变化）
@@ -408,6 +442,8 @@ const MarkdownContent = memo(function MarkdownContent({
       <span
         ref={containerRef}
         className={className}
+        data-markdown-offset={contentOffset}
+        data-markdown-length={debouncedContent.length}
         dangerouslySetInnerHTML={{ __html: html }}
         onClick={handleClick}
       />
@@ -418,6 +454,8 @@ const MarkdownContent = memo(function MarkdownContent({
     <div
       ref={containerRef}
       className={className}
+      data-markdown-offset={contentOffset}
+      data-markdown-length={debouncedContent.length}
       dangerouslySetInnerHTML={{ __html: html }}
       onClick={handleClick}
     />

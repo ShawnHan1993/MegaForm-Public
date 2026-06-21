@@ -29,6 +29,7 @@ import MarkdownContent from './MarkdownContent';
 import NodeCard from './NodeCard';
 import { ArrowRightFromLine, Search, Activity, X, Pin, PinOff, AlertTriangle, CheckCircle2, Plus, ArrowUp } from 'lucide-react';
 import { localizeThinkingDescription, localizeThinkingLabel, useLanguage, useT } from '../i18n';
+import { findLatexRanges } from '../utils/latex';
 
 /** 将文本中所有裸 URL 替换为 Markdown 超链接（缩略展示，最多两层 path） */
 function formatUrlsInText(text: string): string {
@@ -165,6 +166,92 @@ function getFollowupSelectionText(selection: Selection): string {
   return chunks.join('').replace(/\s+/g, ' ').trim() || fallback;
 }
 
+function getSelectionLatexElements(selection: Selection): HTMLElement[] {
+  if (!selection.rangeCount) return [];
+
+  const range = selection.getRangeAt(0);
+  const root = range.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
+    ? range.commonAncestorContainer
+    : range.commonAncestorContainer.parentElement;
+  if (!(root instanceof Element)) return [];
+
+  const closestLatex = root.closest<HTMLElement>('.latex-source[data-latex-source]');
+  const latexElements = [
+    ...(closestLatex ? [closestLatex] : []),
+    ...Array.from(root.querySelectorAll<HTMLElement>('.latex-source[data-latex-source]')),
+  ];
+
+  const seen = new Set<HTMLElement>();
+  return latexElements.filter(el => {
+    if (seen.has(el) || !rangeIntersectsNode(range, el)) return false;
+    seen.add(el);
+    return true;
+  });
+}
+
+function normalizeLatexSelectionRange(selection: Selection): Range | null {
+  const latexElements = getSelectionLatexElements(selection);
+  if (latexElements.length === 0) return null;
+
+  const sourceRange = selection.getRangeAt(0);
+  const range = sourceRange.cloneRange();
+
+  for (const element of latexElements) {
+    if (element.contains(sourceRange.startContainer)) {
+      range.setStartBefore(element);
+      break;
+    }
+  }
+
+  for (let i = latexElements.length - 1; i >= 0; i--) {
+    const element = latexElements[i];
+    if (element.contains(sourceRange.endContainer)) {
+      range.setEndAfter(element);
+      break;
+    }
+  }
+
+  return range;
+}
+
+function getElementForRange(range: Range): Element | null {
+  const container = range.commonAncestorContainer;
+  return container instanceof Element ? container : container.parentElement;
+}
+
+function getSelectionFocusRect(selection: Selection): DOMRect | null {
+  const focusNode = selection.focusNode;
+  if (!focusNode) return null;
+
+  try {
+    if (focusNode.nodeType === Node.TEXT_NODE) {
+      const text = focusNode.textContent || '';
+      const offset = Math.min(selection.focusOffset, text.length);
+      const range = document.createRange();
+      if (offset > 0) {
+        range.setStart(focusNode, offset - 1);
+        range.setEnd(focusNode, offset);
+      } else if (text.length > 0) {
+        range.setStart(focusNode, 0);
+        range.setEnd(focusNode, 1);
+      } else {
+        return null;
+      }
+      const rect = range.getBoundingClientRect();
+      return rect.width > 0 || rect.height > 0 ? rect : null;
+    }
+
+    if (focusNode instanceof Element) {
+      const rect = focusNode.getBoundingClientRect();
+      return rect.width > 0 || rect.height > 0 ? rect : null;
+    }
+  } catch {
+    return null;
+  }
+
+  return null;
+}
+
 function hasLatex(text: string): boolean {
   return /(\$\$[\s\S]+?\$\$|\$[^$\n]+?\$|\\\([\s\S]+?\\\)|\\\[[\s\S]+?\\\])/.test(text);
 }
@@ -173,6 +260,196 @@ function getFollowupLabelPreview(text: string): string {
   if (hasLatex(text)) return text;
   const chars = Array.from(text);
   return chars.length > 30 ? chars.slice(0, 30).join('') + '...' : text;
+}
+
+function toInlineLatexPreview(text: string): string {
+  const trimmed = text.trim();
+  const displayBracket = trimmed.match(/^\\\[([\s\S]*)\\\]$/);
+  if (displayBracket) return `\\(${displayBracket[1].trim()}\\)`;
+
+  const displayDollar = trimmed.match(/^\$\$([\s\S]*)\$\$$/);
+  if (displayDollar) return `\\(${displayDollar[1].trim()}\\)`;
+
+  return text;
+}
+
+function getNutLabelPreview(content: string, nut: Nut): string {
+  const latexRanges = findLatexRanges(content);
+  let start = Math.max(0, Math.min(nut.seek, content.length));
+  let end = Math.max(start, Math.min(nut.end_seek, content.length));
+
+  for (const range of latexRanges) {
+    if (start < range.end && end > range.start) {
+      start = Math.min(start, range.start);
+      end = Math.max(end, range.end);
+    }
+  }
+
+  const preview = content.slice(start, end).trim() || nut.label || '';
+  return toInlineLatexPreview(preview);
+}
+
+interface RenderedSourcePiece {
+  node: globalThis.Node;
+  rawStart: number;
+  rawEnd: number;
+  textLength: number;
+}
+
+function findRenderedPieceInRaw(rawContent: string, text: string, rawCursor: number): { start: number; end: number } | null {
+  if (!text) return null;
+  const directIndex = rawContent.indexOf(text, rawCursor);
+  if (directIndex >= 0) {
+    return { start: directIndex, end: directIndex + text.length };
+  }
+
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const trimmedIndex = rawContent.indexOf(trimmed, rawCursor);
+  if (trimmedIndex >= 0) {
+    const leading = text.indexOf(trimmed);
+    return {
+      start: Math.max(rawCursor, trimmedIndex - Math.max(0, leading)),
+      end: trimmedIndex + trimmed.length,
+    };
+  }
+
+  return null;
+}
+
+function buildRenderedSourcePieces(root: Element, rawContent: string): RenderedSourcePiece[] {
+  const pieces: RenderedSourcePiece[] = [];
+  let rawCursor = 0;
+
+  const addPiece = (node: globalThis.Node, text: string) => {
+    if (!text || (!text.trim() && !node.parentElement?.closest('pre, code'))) return;
+
+    const found = findRenderedPieceInRaw(rawContent, text, rawCursor);
+    if (!found) return;
+
+    pieces.push({
+      node,
+      rawStart: found.start,
+      rawEnd: found.end,
+      textLength: text.length,
+    });
+    rawCursor = found.end;
+  };
+
+  const walk = (node: globalThis.Node) => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      addPiece(node, node.textContent || '');
+      return;
+    }
+
+    if (node.nodeType !== Node.ELEMENT_NODE) return;
+
+    const element = node as Element;
+    if (
+      element.closest('.code-block-header') ||
+      element.closest('button') ||
+      element.closest('.katex-mathml') ||
+      (element.closest('[aria-hidden="true"]') && !element.closest('.latex-source'))
+    ) {
+      return;
+    }
+
+    if (element instanceof HTMLElement && element.matches('.latex-source[data-latex-source]')) {
+      addPiece(element, element.dataset.latexSource || '');
+      return;
+    }
+
+    element.childNodes.forEach(walk);
+  };
+
+  root.childNodes.forEach(walk);
+  return pieces;
+}
+
+function isPieceInsideNode(piece: RenderedSourcePiece, node: globalThis.Node): boolean {
+  return piece.node === node || node.contains(piece.node);
+}
+
+function getFirstPieceInside(node: globalThis.Node, pieces: RenderedSourcePiece[]): RenderedSourcePiece | null {
+  return pieces.find(piece => isPieceInsideNode(piece, node)) || null;
+}
+
+function getLastPieceInside(node: globalThis.Node, pieces: RenderedSourcePiece[]): RenderedSourcePiece | null {
+  for (let i = pieces.length - 1; i >= 0; i--) {
+    if (isPieceInsideNode(pieces[i], node)) return pieces[i];
+  }
+  return null;
+}
+
+function getBoundaryRawOffset(
+  root: Element,
+  pieces: RenderedSourcePiece[],
+  container: globalThis.Node,
+  offset: number,
+  endBoundary: boolean,
+): number | null {
+  if (container.nodeType === Node.TEXT_NODE) {
+    const piece = pieces.find(item => item.node === container);
+    if (!piece) return null;
+    const safeOffset = Math.max(0, Math.min(offset, piece.textLength));
+    const ratio = piece.textLength > 0 ? safeOffset / piece.textLength : 0;
+    return Math.round(piece.rawStart + (piece.rawEnd - piece.rawStart) * ratio);
+  }
+
+  if (container.nodeType !== Node.ELEMENT_NODE && container !== root) return null;
+  const children = Array.from(container.childNodes);
+
+  if (endBoundary) {
+    for (let i = Math.min(offset - 1, children.length - 1); i >= 0; i--) {
+      const piece = getLastPieceInside(children[i], pieces);
+      if (piece) return piece.rawEnd;
+    }
+    for (let i = offset; i < children.length; i++) {
+      const piece = getFirstPieceInside(children[i], pieces);
+      if (piece) return piece.rawStart;
+    }
+    return pieces[pieces.length - 1]?.rawEnd ?? null;
+  }
+
+  for (let i = offset; i < children.length; i++) {
+    const piece = getFirstPieceInside(children[i], pieces);
+    if (piece) return piece.rawStart;
+  }
+  for (let i = Math.min(offset - 1, children.length - 1); i >= 0; i--) {
+    const piece = getLastPieceInside(children[i], pieces);
+    if (piece) return piece.rawEnd;
+  }
+  return pieces[0]?.rawStart ?? null;
+}
+
+function getSelectionSourceRange(range: Range, rawContent: string): { start: number; end: number } | null {
+  const startElement = range.startContainer.nodeType === Node.ELEMENT_NODE
+    ? range.startContainer as Element
+    : range.startContainer.parentElement;
+  const endElement = range.endContainer.nodeType === Node.ELEMENT_NODE
+    ? range.endContainer as Element
+    : range.endContainer.parentElement;
+
+  const startMarkdown = startElement?.closest<HTMLElement>('.markdown-body[data-markdown-offset][data-markdown-length]');
+  const endMarkdown = endElement?.closest<HTMLElement>('.markdown-body[data-markdown-offset][data-markdown-length]');
+  if (!startMarkdown || startMarkdown !== endMarkdown) return null;
+
+  const contentOffset = Number(startMarkdown.dataset.markdownOffset || 0);
+  const contentLength = Number(startMarkdown.dataset.markdownLength || 0);
+  if (!Number.isFinite(contentOffset) || !Number.isFinite(contentLength) || contentLength <= 0) return null;
+
+  const segmentContent = rawContent.slice(contentOffset, contentOffset + contentLength);
+  const pieces = buildRenderedSourcePieces(startMarkdown, segmentContent);
+  if (!pieces.length) return null;
+
+  const localStart = getBoundaryRawOffset(startMarkdown, pieces, range.startContainer, range.startOffset, false);
+  const localEnd = getBoundaryRawOffset(startMarkdown, pieces, range.endContainer, range.endOffset, true);
+  if (localStart === null || localEnd === null || localEnd <= localStart) return null;
+
+  return {
+    start: Math.max(0, Math.min(contentOffset + localStart, rawContent.length)),
+    end: Math.max(0, Math.min(contentOffset + localEnd, rawContent.length)),
+  };
 }
 
 interface Props {
@@ -245,6 +522,24 @@ function splitContentAtNuts(
 
   const segments: Segment[] = [];
   let lastEnd = 0;
+  const latexRanges = findLatexRanges(content);
+
+  const expandSplitPointPastLatex = (pos: number): number => {
+    let splitPoint = pos;
+    let changed = true;
+
+    while (changed) {
+      changed = false;
+      for (const range of latexRanges) {
+        if (splitPoint > range.start && splitPoint < range.end) {
+          splitPoint = range.end;
+          changed = true;
+        }
+      }
+    }
+
+    return splitPoint;
+  };
 
   // 判断某个位置是否在 Markdown 表格内
   const isInTable = (pos: number): boolean => {
@@ -264,7 +559,7 @@ function splitContentAtNuts(
       if (!nextLine.startsWith('|')) {
         // 表格结束，找到段落分隔符
         const paraEnd = content.indexOf('\n\n', nextNewline);
-        return paraEnd >= 0 ? paraEnd + 2 : nextNewline + 1;
+        return expandSplitPointPastLatex(paraEnd >= 0 ? paraEnd + 2 : nextNewline + 1);
       }
       searchFrom = nextNewline + 1;
     }
@@ -274,9 +569,9 @@ function splitContentAtNuts(
   // 找到当前行末尾位置
   const findLineEnd = (pos: number): number => {
     for (let i = pos; i < content.length; i++) {
-      if (content[i] === '\n') return i;
+      if (content[i] === '\n') return expandSplitPointPastLatex(i);
     }
-    return content.length;
+    return expandSplitPointPastLatex(content.length);
   };
 
   // 收集同一表格内所有 nut，统一在表格结束位置插入
@@ -342,50 +637,6 @@ function splitContentAtNuts(
   }
 
   return segments;
-}
-
-/**
- * 在 markdown 原文中查找选中文本的位置
- * 策略1：直接搜索 → 策略2：去格式搜索
- */
-// ═══════════════════════════════════════════════════════════════
-// findTextPosition — 在 Markdown 原文中查找选中文本位置
-// ═══════════════════════════════════════════════════════════════
-// 策略1: 直接搜索 → 策略2: 去格式字符后搜索 (plain text 映射)
-function findTextPosition(rawContent: string, selectedText: string): { start: number; end: number } | null {
-  // 策略1：直接搜索
-  const directIdx = rawContent.indexOf(selectedText);
-  if (directIdx >= 0) return { start: directIdx, end: directIdx + selectedText.length };
-
-  // 策略2：去格式搜索 — 构建 plain↔raw 映射
-  const formatChars = new Set(['#', '*', '[', ']', '(', ')', '>', '_', '~', '`', '|', '!']);
-  const plainToRaw: number[] = [];
-  let lastPlainWasSpace = false;
-  let plain = '';
-
-  for (let rawIdx = 0; rawIdx < rawContent.length; rawIdx++) {
-    const ch = rawContent[rawIdx];
-    if (formatChars.has(ch)) continue;
-    if (ch === ' ' || ch === '\n' || ch === '\t') {
-      if (lastPlainWasSpace) continue;
-      plainToRaw.push(rawIdx);
-      plain += ' ';
-      lastPlainWasSpace = true;
-    } else {
-      plainToRaw.push(rawIdx);
-      plain += ch;
-      lastPlainWasSpace = false;
-    }
-  }
-
-  const plainIdx = plain.indexOf(selectedText);
-  if (plainIdx < 0) return null;
-
-  const startRaw = plainToRaw[plainIdx];
-  const endRaw = plainToRaw[plainIdx + selectedText.length - 1];
-  if (startRaw === undefined || endRaw === undefined) return null;
-
-  return { start: startRaw, end: endRaw + 1 };
 }
 
 // 虚拟 nut/followup 的固定 ID
@@ -471,6 +722,8 @@ export default function ResponseArea({
     scrollTopAtSelect: number;  // 选中时的 scrollTop，用于滚动补偿
     responseId: string;
     modelId: string;
+    seek: number;
+    endSeek: number;
   } | null>(null);
   const [followupInput, setFollowupInput] = useState('');
   const [showFollowupInput, setShowFollowupInput] = useState(false);
@@ -604,8 +857,7 @@ export default function ResponseArea({
     return () => document.removeEventListener('mousedown', handler);
   }, [thinkingPopoverFor]);
 
-  const getMobileThinkingPopoverPosition = (target: HTMLElement) => {
-    if (!isMobile) return null;
+  const getThinkingPopoverPosition = (target: HTMLElement) => {
     const rect = target.getBoundingClientRect();
     const popoverHalfWidth = 100;
     const edgePadding = 14;
@@ -623,14 +875,14 @@ export default function ResponseArea({
     const isClosing = thinkingPopoverFor === modelId;
     thinkingPopoverTriggerRef.current = isClosing ? null : target;
     setThinkingPopoverFor(isClosing ? null : modelId);
-    setThinkingPopoverPosition(isClosing ? null : getMobileThinkingPopoverPosition(target));
+    setThinkingPopoverPosition(isClosing ? null : getThinkingPopoverPosition(target));
   };
 
   const openFollowupThinkingPopoverFromTouch = (modelId: string, target: HTMLElement) => {
     suppressNextFollowupThinkingClickRef.current = true;
     thinkingPopoverTriggerRef.current = target;
     setThinkingPopoverFor(modelId);
-    setThinkingPopoverPosition(getMobileThinkingPopoverPosition(target));
+    setThinkingPopoverPosition(getThinkingPopoverPosition(target));
   };
 
   const getModelThinkingLevels = (model: { provider: string; model_name: string }): ThinkingLevel[] | undefined => {
@@ -688,6 +940,7 @@ export default function ResponseArea({
   // 用 ref 追踪 selectionInfo，避免在 effect 回调中读取过期闭包值
   const selectionInfoRef = useRef(selectionInfo);
   selectionInfoRef.current = selectionInfo;
+  const [selectionListening, setSelectionListening] = useState(false);
   // 滚动时触发重渲染，使 tooltip 位置跟随文字
   const [scrollTick, setScrollTick] = useState(0);
 
@@ -769,12 +1022,13 @@ export default function ResponseArea({
   // 公式: tooltipY = viewportY - (currentScrollTop - scrollTopAtSelect)
   // 监听 .chat-area 滚动，触发 tooltip 位置更新
   useEffect(() => {
+    if (!selectionInfo) return;
     const chatArea = responseAreaRef.current?.closest('.chat-area') as HTMLElement | null;
     if (!chatArea) return;
     const onScroll = () => setScrollTick(t => t + 1);
-    chatArea.addEventListener('scroll', onScroll);
+    chatArea.addEventListener('scroll', onScroll, { passive: true });
     return () => chatArea.removeEventListener('scroll', onScroll);
-  }, []);
+  }, [selectionInfo]);
 
   // 根据 selectionInfo 计算 tooltip 视口坐标（含滚动补偿）
   // 计算 tooltip 视口坐标 (含滚动补偿: y = viewportY - scrollDelta)
@@ -796,6 +1050,8 @@ export default function ResponseArea({
     text: string;
     responseId: string;
     modelId: string;
+    seek: number;
+    endSeek: number;
     followupContent: string;
   } | null>(null);
 
@@ -908,8 +1164,11 @@ export default function ResponseArea({
 
     // ── 处理 pending followup：创建虚拟 nut 劈开原文 ──
     if (pendingFollowup && pendingFollowup.responseId === response.id) {
-      const pos = findTextPosition(response.content, pendingFollowup.text);
-      if (pos) {
+      const pos = {
+        start: Math.max(0, Math.min(pendingFollowup.seek, response.content.length)),
+        end: Math.max(0, Math.min(pendingFollowup.endSeek, response.content.length)),
+      };
+      if (pos.end > pos.start) {
         // 检查是否和已有 nut 重叠
         const overlap = nuts.some(n =>
           (n.seek <= pos.start && n.end_seek > pos.start) ||
@@ -921,7 +1180,7 @@ export default function ResponseArea({
             response_id: response.id,
             seek: pos.start,
             end_seek: pos.end,
-            label: pendingFollowup.text.slice(0, 50),
+            label: pendingFollowup.text,
             style: null,
             meta: '{}',
             created_at: new Date().toISOString(),
@@ -1042,7 +1301,7 @@ export default function ResponseArea({
                   <span className="followup-inline-icon"><ArrowRightFromLine size={14} /></span>
                   {seg.nut.label && (
                     <span className="followup-inline-label">
-                      「<MarkdownContent content={seg.nut.label} inline />」
+                      「<MarkdownContent content={getNutLabelPreview(response.content, seg.nut)} inline />」
                     </span>
                   )}
                   {seg.nodes.length > 0 && seg.nodes[0].parent_model_id && (
@@ -1082,6 +1341,7 @@ export default function ResponseArea({
   // ── 监听文本选择（document 级别，避免鼠标在区域外松开时丢失事件） ──
   useEffect(() => {
     if (immersive) return;
+    if (!selectionListening && !selectionInfo && !showFollowupInput) return;
 
     // 标记：是否刚刚设置了 selectionInfo，避免 selectionchange 清除刚设的值
     let justSetSelection = false;
@@ -1089,42 +1349,51 @@ export default function ResponseArea({
     // ━━━ detectSelection — 核心: 检测文本选择并设置 tooltip 状态 ━━━
     // 仅在选区非空、选区内有文字、选区在当前 ResponseArea 内时激活
     // 记录 viewportX/Y + scrollTopAtSelect 用于后续滚动补偿
-    const detectSelection = () => {
+    const detectSelection = (): boolean => {
       const selection = window.getSelection();
       if (!selection || selection.isCollapsed) {
-        return;
+        return false;
       }
 
       const selectedText = getFollowupSelectionText(selection);
-      if (!selectedText) return;
+      if (!selectedText) return false;
 
-      const anchorNode = selection.anchorNode;
-      if (!anchorNode) return;
-
-      const element = anchorNode instanceof Element ? anchorNode : anchorNode.parentElement;
-      if (!element) return;
+      const sourceRange = selection.getRangeAt(0);
+      const element = getElementForRange(sourceRange);
+      if (!element) return false;
 
       // 检查选区是否在当前组件的 .response-area 内
       const closestArea = element.closest('.response-area');
-      if (!closestArea) return;
+      if (!closestArea) return false;
       // 用唯一 ID 匹配：确保是当前组件实例的 response-area
-      if (closestArea !== responseAreaRef.current) return;
+      if (closestArea !== responseAreaRef.current) return false;
 
       const responseCard = element.closest('.response-card');
-      if (!responseCard) return;
+      if (!responseCard) return false;
 
       const modelId = responseCard.getAttribute('data-model-id');
       const responseId = responseCard.getAttribute('data-response-id');
-      if (!modelId) return;
+      if (!modelId) return false;
+      const response = responses.find(r => r.id === responseId || r.model_id === modelId);
+      if (!response) return false;
 
-      const range = selection.getRangeAt(0);
+      const focusRect = getSelectionFocusRect(selection);
+      const latexRange = normalizeLatexSelectionRange(selection);
+      const range = latexRange || selection.getRangeAt(0);
+      if (latexRange) {
+        selection.removeAllRanges();
+        selection.addRange(latexRange);
+      }
       const rect = range.getBoundingClientRect();
-      if (rect.width === 0 && rect.height === 0) return;
+      if (rect.width === 0 && rect.height === 0) return false;
+
+      const anchorRange = getSelectionSourceRange(range, response.content);
+      if (!anchorRange) return false;
 
       // 获取选区最后一个字符的视口位置（用于定位 tooltip）
-      let viewportX = rect.right;
-      let viewportY = rect.bottom + 6;
-      if (range.endOffset > 0 && range.endContainer.nodeType === Node.TEXT_NODE) {
+      let viewportX = focusRect?.right ?? rect.right;
+      let viewportY = (focusRect?.bottom ?? rect.bottom) + 6;
+      if (!focusRect && range.endOffset > 0 && range.endContainer.nodeType === Node.TEXT_NODE) {
         try {
           const endRange = document.createRange();
           endRange.setStart(range.endContainer, range.endOffset - 1);
@@ -1163,13 +1432,38 @@ export default function ResponseArea({
         scrollTopAtSelect,
         responseId: responseId || '',
         modelId,
+        seek: anchorRange.start,
+        endSeek: anchorRange.end,
       });
       // 短暂标记，防止 selectionchange 立刻清除
       setTimeout(() => { justSetSelection = false; }, 100);
+      return true;
     };
 
+    let isMouseSelecting = false;
+    const handleDocMouseDown = (event: MouseEvent) => {
+      isMouseSelecting = true;
+      const target = event.target as Element | null;
+      if (
+        selectionInfoRef.current &&
+        target &&
+        !target.closest('.followup-container') &&
+        !target.closest('.followup-input-popup') &&
+        !target.closest('.thinking-popover')
+      ) {
+        savedSelectionRef.current = null;
+        setSelectionInfo(null);
+        setShowFollowupInput(false);
+        setFollowupInput('');
+        try { CSS.highlights.delete('selection-tooltip-highlight'); } catch {}
+      }
+    };
     const handleDocMouseUp = () => {
-      detectSelection();
+      isMouseSelecting = false;
+      const detected = detectSelection();
+      if (!detected && !selectionInfoRef.current && !showFollowupInput) {
+        setSelectionListening(false);
+      }
     };
 
     // ━━━ 移动端触摸处理 ━━━
@@ -1185,7 +1479,10 @@ export default function ResponseArea({
       // 延迟一小段时间，等选区稳定后再检测
       if (touchTimer) clearTimeout(touchTimer);
       touchTimer = setTimeout(() => {
-        detectSelection();
+        const detected = detectSelection();
+        if (!detected && !selectionInfoRef.current && !showFollowupInput) {
+          setSelectionListening(false);
+        }
         touchTimer = null;
       }, 300);
     };
@@ -1193,6 +1490,8 @@ export default function ResponseArea({
     // 备用：selectionchange 事件捕获键盘选中等其他方式
     const handleSelectionChange = () => {
       if (justSetSelection) return;
+      // 鼠标拖选过程中不处理，避免刚选中 1 个字符就锁定 Range。
+      if (isMouseSelecting) return;
       // 触摸过程中不处理 — 等 touchend 后再检测，避免频繁 re-render 打断选文字
       if (isTouching) return;
       const selection = window.getSelection();
@@ -1207,21 +1506,24 @@ export default function ResponseArea({
       detectSelection();
     };
 
+    document.addEventListener('mousedown', handleDocMouseDown);
     document.addEventListener('mouseup', handleDocMouseUp);
     document.addEventListener('touchstart', handleTouchStart);
     document.addEventListener('touchend', handleTouchEnd);
     document.addEventListener('selectionchange', handleSelectionChange);
     return () => {
+      document.removeEventListener('mousedown', handleDocMouseDown);
       document.removeEventListener('mouseup', handleDocMouseUp);
       document.removeEventListener('touchstart', handleTouchStart);
       document.removeEventListener('touchend', handleTouchEnd);
       document.removeEventListener('selectionchange', handleSelectionChange);
       if (touchTimer) clearTimeout(touchTimer);
     };
-  }, [immersive, showFollowupInput]);
+  }, [immersive, selectionInfo, selectionListening, showFollowupInput]);
 
   // 点击"追问容器"之外的区域 → 关闭 tooltip 或输入弹窗
   useEffect(() => {
+    if (!selectionInfo) return;
     // 点击追问容器外部 → 关闭 tooltip/popup (移动端 500ms 内忽略合成 mousedown)
     const handleClickAway = (e: MouseEvent) => {
       const target = e.target as Element;
@@ -1234,6 +1536,7 @@ export default function ResponseArea({
       // 有 selectionInfo 就清除（tooltip 或输入弹窗都统一关闭）
       if (selectionInfo) {
         setSelectionInfo(null);
+        setSelectionListening(false);
         setShowFollowupInput(false);
         setFollowupInput('');
         window.getSelection()?.removeAllRanges();
@@ -1284,6 +1587,8 @@ export default function ResponseArea({
       text: savedSelectionInfo.text,
       responseId: savedSelectionInfo.responseId,
       modelId: savedSelectionInfo.modelId,
+      seek: savedSelectionInfo.seek,
+      endSeek: savedSelectionInfo.endSeek,
       followupContent: savedFollowupInput,
     });
 
@@ -1299,6 +1604,8 @@ export default function ResponseArea({
         parentId: nodeId,
         relation: 'followup',
         partialContent: savedSelectionInfo.text,
+        followupSeek: savedSelectionInfo.seek,
+        followupEndSeek: savedSelectionInfo.endSeek,
         parentModelId: savedSelectionInfo.modelId,
         modelIds: selectedModelIds.length > 0 ? selectedModelIds : undefined,
         webSearch: webSearchEnabled,
@@ -1464,7 +1771,13 @@ export default function ResponseArea({
   }, [nodeId, currentTreeNode, getDeepestPathModels]);
 
   return (
-    <div className="response-area" ref={responseAreaRef} style={{ WebkitTouchCallout: 'none' }}>
+    <div
+      className="response-area"
+      ref={responseAreaRef}
+      style={{ WebkitTouchCallout: 'none' }}
+      onMouseDownCapture={() => setSelectionListening(true)}
+      onTouchStartCapture={() => setSelectionListening(true)}
+    >
       {/* 模型选择栏 */}
       <div className="model-bar" data-frozen-anchor={nodeId}>
         <AnimatePresence initial={false} mode="popLayout">

@@ -24,10 +24,58 @@ from app_state import (
     json,
     log,
 )
+from context_builder import CONTEXT_MAX_CHARS_SETTING, normalize_context_max_chars
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
+RECENT_NODE_IDS_SETTING = "recent_node_ids"
+RECENT_NODE_LIMIT = 10
+
+
+def _latex_ranges(content: str) -> list[tuple[int, int]]:
+    patterns = [
+        r"\\\[([\s\S]*?)\\\]",
+        r"\$\$([\s\S]*?)\$\$",
+        r"\\\(([\s\S]*?)\\\)",
+        r"\$([^$\n]{1,500}?)\$",
+    ]
+    ranges: list[tuple[int, int]] = []
+    import re
+
+    for pattern in patterns:
+        for match in re.finditer(pattern, content):
+            math = match.group(1).strip() if match.lastindex else ""
+            if not math:
+                continue
+            if pattern.startswith(r"\$") and re.fullmatch(r"\d+(\.\d+)?", math):
+                continue
+            ranges.append((match.start(), match.end()))
+
+    ranges.sort(key=lambda item: (item[0], -item[1]))
+    non_overlapping: list[tuple[int, int]] = []
+    last_end = -1
+    for start, end in ranges:
+        if start >= last_end:
+            non_overlapping.append((start, end))
+            last_end = end
+    return non_overlapping
+
+
+def _nut_reference_text(response_content: str, nut: dict) -> str:
+    start = max(0, min(int(nut.get("seek") or 0), len(response_content)))
+    end = max(start, min(int(nut.get("end_seek") or start), len(response_content)))
+
+    for range_start, range_end in _latex_ranges(response_content):
+        if start < range_end and end > range_start:
+            start = min(start, range_start)
+            end = max(end, range_end)
+
+    text = response_content[start:end].strip()
+    if text:
+        return text
+    label = nut.get("label")
+    return label.strip() if isinstance(label, str) else ""
 
 @router.get("/api/search")
 def search(request: Request, q: str = Query(""), group_id: list[str] = Query(default=[])):
@@ -35,6 +83,82 @@ def search(request: Request, q: str = Query(""), group_id: list[str] = Query(def
         return JSONResponse([])
     user_id = _get_user_id(request)
     return JSONResponse(db.search_all(q, user_id=user_id, group_ids=group_id))
+
+
+def _load_recent_node_ids(user_id: str) -> list[str]:
+    raw = db.get_setting(RECENT_NODE_IDS_SETTING, "[]", user_id=user_id)
+    try:
+        ids = json.loads(raw)
+    except Exception:
+        ids = []
+    if not isinstance(ids, list):
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for nid in ids:
+        if not isinstance(nid, str) or not nid or nid in seen:
+            continue
+        seen.add(nid)
+        result.append(nid)
+        if len(result) >= RECENT_NODE_LIMIT:
+            break
+    return result
+
+
+def _recent_node_payload(node: dict, user_id: str) -> dict:
+    node = dict(node)
+    node["child_count"] = db.count_descendants(node["id"], user_id=user_id)
+    node["followup_quote"] = None
+    if node.get("relation") == "followup" and node.get("nut_id"):
+        nut = db.get_nut(node["nut_id"], user_id=user_id)
+        if nut:
+            response = db.get_response(nut["response_id"], user_id=user_id)
+            if response and isinstance(response.get("content"), str):
+                node["followup_quote"] = _nut_reference_text(response["content"], nut)
+            else:
+                label = nut.get("label")
+                if isinstance(label, str) and label.strip():
+                    node["followup_quote"] = label.strip()
+    return node
+
+
+@router.get("/api/recent-nodes")
+def get_recent_nodes(request: Request):
+    user_id = _get_user_id(request)
+    ids = _load_recent_node_ids(user_id)
+    nodes = []
+    valid_ids = []
+    for node_id in ids:
+        node = db.get_node(node_id, user_id=user_id)
+        if not node:
+            continue
+        valid_ids.append(node_id)
+        nodes.append(_recent_node_payload(node, user_id))
+    if valid_ids != ids:
+        db.set_setting(RECENT_NODE_IDS_SETTING, json.dumps(valid_ids, ensure_ascii=False), user_id=user_id)
+    return JSONResponse({"nodes": nodes, "node_ids": valid_ids})
+
+
+@router.put("/api/recent-nodes")
+async def save_recent_nodes(request: Request):
+    user_id = _get_user_id(request)
+    data = await request.json()
+    raw_ids = data.get("node_ids", [])
+    if not isinstance(raw_ids, list):
+        raw_ids = []
+    ids = []
+    seen = set()
+    for node_id in raw_ids:
+        if not isinstance(node_id, str) or not node_id or node_id in seen:
+            continue
+        if not db.get_node(node_id, user_id=user_id):
+            continue
+        seen.add(node_id)
+        ids.append(node_id)
+        if len(ids) >= RECENT_NODE_LIMIT:
+            break
+    db.set_setting(RECENT_NODE_IDS_SETTING, json.dumps(ids, ensure_ascii=False), user_id=user_id)
+    return JSONResponse({"status": "ok", "node_ids": ids})
 
 
 # ═══════════════════════════════════════════════
@@ -427,6 +551,8 @@ async def save_settings(request: Request):
     if PROFILE_UPDATE_MODEL_SETTING in data:
         model_id = str(data.get(PROFILE_UPDATE_MODEL_SETTING) or "").strip()
         data[PROFILE_UPDATE_MODEL_SETTING] = model_id if _get_model_config_for_call(model_id, user_id=user_id) else ""
+    if CONTEXT_MAX_CHARS_SETTING in data:
+        data[CONTEXT_MAX_CHARS_SETTING] = str(normalize_context_max_chars(data.get(CONTEXT_MAX_CHARS_SETTING)))
     db.batch_set_settings({k: str(v) for k, v in data.items()}, user_id=user_id)
     return JSONResponse({"status": "ok"})
 

@@ -15,7 +15,7 @@ from app_state import (
     json,
     log,
 )
-from context_builder import build_context, find_partial_position
+from context_builder import build_context
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from streaming import (
@@ -100,6 +100,8 @@ async def api_chat_stream(request: Request):
     logic_node = bool(data.get("logic_node"))
     nut_id = data.get("nut_id")
     partial_content = data.get("partial_content")
+    followup_seek = data.get("followup_seek")
+    followup_end_seek = data.get("followup_end_seek")
     web_search_enabled = data.get("web_search", False)
     thinking_budgets = data.get("thinking_budgets", {})
     use_profile = _should_use_profile(data.get("use_profile"), user_id=user_id)
@@ -137,6 +139,7 @@ async def api_chat_stream(request: Request):
             parent_id, content, mid,
             current_nut_id=nut_id,
             current_partial_content=partial_content,
+            current_followup_end_seek=followup_end_seek,
             current_parent_model_id=parent_model_id,
             relation=relation,
             user_id=user_id,
@@ -174,16 +177,21 @@ async def api_chat_stream(request: Request):
     if nut_id:
         node_kwargs["nut_id"] = nut_id
 
-    # 自动创建螺母
+    # 自动创建螺母：位置由前端根据用户原生选区计算，避免用引用文本反查导致锚点漂移。
     created_nut = None
-    if partial_content and parent_id and parent_model_id:
+    if partial_content and parent_id and parent_model_id and followup_seek is not None and followup_end_seek is not None:
         resps = db.get_node_responses(parent_id, user_id=user_id)
         target_resp = next((r for r in resps if r["model_id"] == parent_model_id), None)
         if target_resp:
-            nut_seek, nut_end_seek = find_partial_position(
-                target_resp["content"], partial_content
-            )
-            if nut_end_seek > 0:
+            raw_content = target_resp["content"] or ""
+            try:
+                nut_seek = int(followup_seek)
+                nut_end_seek = int(followup_end_seek)
+            except (TypeError, ValueError):
+                nut_seek, nut_end_seek = 0, 0
+            nut_seek = max(0, min(nut_seek, len(raw_content)))
+            nut_end_seek = max(nut_seek, min(nut_end_seek, len(raw_content)))
+            if nut_end_seek > nut_seek:
                 created_nut = db.create_nut(
                     target_resp["id"], nut_seek, nut_end_seek,
                     user_id=user_id,

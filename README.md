@@ -7,7 +7,8 @@
 把传统线性的「一问一答」组织成可展开、可折叠、可深链接的**对话树**。比较答案、分叉追问、回溯历史，一目了然。
 
 ![主页](screenshot.png)
-![对话树](screenshot2.png)
+![对话](screenshot2.png)
+![对话概览](screenshot3.png)
 
 ---
 
