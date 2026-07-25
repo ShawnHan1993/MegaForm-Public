@@ -24,6 +24,7 @@ import type { Nut } from '../types';
 import type { Tokens } from 'marked';
 import { getLanguage, tr } from '../i18n';
 import { useMemo, memo, useEffect, useRef, useCallback, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { findLatexRanges, renderLatexToPlaceholders, restoreLatexPlaceholders } from '../utils/latex';
 
 interface Props {
@@ -33,7 +34,9 @@ interface Props {
   hoveredNutId?: string | null;
   collapsedNutIds?: Set<string>;
   pendingNutIds?: Set<string>;
+  focusNutIds?: Set<string>;
   onCollapsedNutClick?: (nutId: string) => void;
+  onFocusNutOpen?: (nutId: string) => void;
   /** 是否处于流式输出状态（启用防抖减少闪跳） */
   streaming?: boolean;
   /** 搜索命中词：渲染后包裹第一个匹配文本节点，供 ChatArea 精确滚动 */
@@ -116,6 +119,113 @@ function escapeAttr(value: string): string {
   return escapeHtml(value).replace(/`/g, '&#96;');
 }
 
+const IMPLICIT_CAPTION_PATTERN = /^(?:Figure|Table)\b/i;
+const IMPLICIT_CAPTION_CLASS = 'markdown-implicit-caption';
+
+function isWhitespaceOrBreak(node: Node): boolean {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return !(node.textContent || '').trim();
+  }
+  return node instanceof HTMLElement && node.matches('br');
+}
+
+function getInlineLineText(nodes: Node[], start: number): string {
+  let text = '';
+  for (let index = start; index < nodes.length; index += 1) {
+    const node = nodes[index];
+    if (node instanceof HTMLElement && node.matches('br')) break;
+    if (
+      node instanceof HTMLElement
+      && (node.matches('img') || Boolean(node.querySelector('img')))
+    ) {
+      return '';
+    }
+    text += node.textContent || '';
+  }
+  return text.trimStart();
+}
+
+function markInlineCaptionLine(paragraph: HTMLParagraphElement): boolean {
+  const nodes = Array.from(paragraph.childNodes);
+
+  for (let breakIndex = 0; breakIndex < nodes.length; breakIndex += 1) {
+    const lineBreak = nodes[breakIndex];
+    if (!(lineBreak instanceof HTMLElement) || !lineBreak.matches('br')) continue;
+
+    let captionIndex = breakIndex + 1;
+    while (captionIndex < nodes.length && isWhitespaceOrBreak(nodes[captionIndex])) {
+      captionIndex += 1;
+    }
+
+    const captionNodes = nodes.slice(captionIndex);
+    const captionText = getInlineLineText(nodes, captionIndex);
+    if (!IMPLICIT_CAPTION_PATTERN.test(captionText)) continue;
+
+    // A Markdown hard break keeps the caption in its surrounding paragraph.
+    // The caption span is block-level, so discard only the redundant separator.
+    nodes.slice(breakIndex, captionIndex).forEach(node => node.remove());
+
+    const caption = document.createElement('span');
+    caption.className = IMPLICIT_CAPTION_CLASS;
+    captionNodes.forEach(node => caption.appendChild(node));
+    paragraph.appendChild(caption);
+    paragraph.classList.add('markdown-has-inline-caption');
+    return true;
+  }
+
+  return false;
+}
+
+function isMediaBlock(element: Element): boolean {
+  if (element.matches('table, img')) return true;
+  if (element.matches('figure')) return Boolean(element.querySelector('img'));
+  return element.matches('p')
+    && Boolean(element.querySelector('img'))
+    && !(element.textContent || '').trim();
+}
+
+function isWhitespaceOnlyBlock(element: Element): boolean {
+  return element.matches('p, div')
+    && !(element.textContent || '').trim()
+    && !element.querySelector('img, table, pre, hr, svg, video, audio');
+}
+
+function previousSignificantElement(element: Element): Element | null {
+  let previous = element.previousElementSibling;
+  while (previous && isWhitespaceOnlyBlock(previous)) {
+    previous = previous.previousElementSibling;
+  }
+  return previous;
+}
+
+/**
+ * MinerU/PDF Markdown may leave captions as ordinary paragraphs. Mark a paragraph
+ * as a caption whenever it starts with Figure/Table. If it immediately follows
+ * an image or table, also mark that media block so CSS can remove the gap.
+ */
+function annotateImplicitCaptions(html: string): string {
+  if (typeof document === 'undefined') return html;
+
+  const template = document.createElement('template');
+  template.innerHTML = html;
+
+  const paragraphs = Array.from(template.content.querySelectorAll<HTMLParagraphElement>('p'));
+  paragraphs.forEach(markInlineCaptionLine);
+
+  paragraphs.forEach(paragraph => {
+    if (paragraph.classList.contains('markdown-has-inline-caption')) return;
+    if (!IMPLICIT_CAPTION_PATTERN.test((paragraph.textContent || '').trimStart())) return;
+
+    const previous = previousSignificantElement(paragraph);
+    if (previous && isMediaBlock(previous)) {
+      previous.classList.add('markdown-captioned-media');
+    }
+    paragraph.classList.add(IMPLICIT_CAPTION_CLASS);
+  });
+
+  return template.innerHTML;
+}
+
 const markdownRenderer = new Renderer();
 const STREAMING_RENDER_DEBOUNCE_MS = 100;
 let highlightJsPromise: Promise<typeof import('highlight.js/lib/common').default> | null = null;
@@ -123,6 +233,99 @@ let highlightJsPromise: Promise<typeof import('highlight.js/lib/common').default
 function loadHighlightJs() {
   highlightJsPromise ||= import('highlight.js/lib/common').then(({ default: hljs }) => hljs);
   return highlightJsPromise;
+}
+
+interface CodeReferenceMark {
+  start: number;
+  end: number;
+  className: string;
+  nutId: string | null;
+  collapsed: boolean;
+  focus: boolean;
+}
+
+interface FocusedImage {
+  src: string;
+  alt: string;
+}
+
+const MIN_FOCUSED_IMAGE_SCALE = 0.5;
+const MAX_FOCUSED_IMAGE_SCALE = 5;
+
+function clampFocusedImageScale(scale: number): number {
+  return Math.min(MAX_FOCUSED_IMAGE_SCALE, Math.max(MIN_FOCUSED_IMAGE_SCALE, scale));
+}
+
+function getTouchDistance(touches: React.TouchList): number {
+  const first = touches.item(0);
+  const second = touches.item(1);
+  if (!first || !second) return 0;
+  return Math.hypot(second.clientX - first.clientX, second.clientY - first.clientY);
+}
+
+function getTextOffset(root: HTMLElement, boundary: Node, offset: number): number {
+  const range = document.createRange();
+  range.setStart(root, 0);
+  range.setEnd(boundary, offset);
+  return range.toString().length;
+}
+
+function captureCodeReferenceMarks(block: HTMLElement): CodeReferenceMark[] {
+  return Array.from(block.querySelectorAll<HTMLElement>('.nut-highlight, .nut-collapsed, .nut-pending, .nut-focus-anchor'))
+    .map(mark => ({
+      start: getTextOffset(block, mark, 0),
+      end: getTextOffset(block, mark, mark.childNodes.length),
+      className: mark.className,
+      nutId: mark.getAttribute('data-nut-id'),
+      collapsed: mark.getAttribute('data-nut-collapsed') === 'true',
+      focus: mark.classList.contains('nut-focus-anchor'),
+    }))
+    .filter(mark => mark.end > mark.start)
+    .sort((a, b) => b.start - a.start);
+}
+
+function findTextBoundary(root: HTMLElement, target: number): { node: Text; offset: number } | null {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let consumed = 0;
+  let node = walker.nextNode() as Text | null;
+  let last: Text | null = null;
+
+  while (node) {
+    const length = node.data.length;
+    if (target <= consumed + length) {
+      return { node, offset: Math.max(0, target - consumed) };
+    }
+    consumed += length;
+    last = node;
+    node = walker.nextNode() as Text | null;
+  }
+
+  return last && target === consumed ? { node: last, offset: last.data.length } : null;
+}
+
+function restoreCodeReferenceMarks(block: HTMLElement, marks: CodeReferenceMark[]) {
+  // Reverse source order keeps earlier offsets stable while later ranges are wrapped.
+  for (const mark of marks) {
+    const start = findTextBoundary(block, mark.start);
+    const end = findTextBoundary(block, mark.end);
+    if (!start || !end) continue;
+
+    const range = document.createRange();
+    range.setStart(start.node, start.offset);
+    range.setEnd(end.node, end.offset);
+
+    const wrapper = document.createElement('span');
+    wrapper.className = mark.className;
+    if (mark.nutId) wrapper.setAttribute('data-nut-id', mark.nutId);
+    if (mark.collapsed) wrapper.setAttribute('data-nut-collapsed', 'true');
+    if (mark.focus) {
+      wrapper.setAttribute('data-nut-focus', 'true');
+      wrapper.setAttribute('role', 'link');
+      wrapper.tabIndex = 0;
+    }
+    wrapper.appendChild(range.extractContents());
+    range.insertNode(wrapper);
+  }
 }
 
 markdownRenderer.code = ({ text, lang, escaped }: Tokens.Code): string => {
@@ -199,13 +402,28 @@ const MarkdownContent = memo(function MarkdownContent({
   hoveredNutId,
   collapsedNutIds,
   pendingNutIds,
+  focusNutIds,
   onCollapsedNutClick,
+  onFocusNutOpen,
   streaming = false,
   searchQuery,
   searchHitId,
   inline = false,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const [focusedImage, setFocusedImage] = useState<FocusedImage | null>(null);
+  const focusedImageElementRef = useRef<HTMLImageElement>(null);
+  const focusedImageScaleRef = useRef(1);
+  const focusedImageOffsetRef = useRef({ x: 0, y: 0 });
+  const focusedImageFrameRef = useRef<number | null>(null);
+  const focusedImageDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    originX: number;
+    originY: number;
+  } | null>(null);
+  const pinchGestureRef = useRef<{ distance: number; scale: number } | null>(null);
 
   // ── 流式渲染策略 ──
   // 粒度：约 100ms 合并渲染，避免长回答逐 token 反复 Markdown/KaTeX parse。
@@ -243,7 +461,10 @@ const MarkdownContent = memo(function MarkdownContent({
 
     let processedContent = debouncedContent;
 
-    const allNutsToMark: { nut: Nut; type: 'collapsed' | 'highlighted' | 'pending' }[] = [];
+    const allNutsToMark: {
+      nut: Nut;
+      type: 'collapsed' | 'highlighted' | 'pending' | 'focus';
+    }[] = [];
 
     if (collapsedNutIds && collapsedNutIds.size > 0) {
       for (const nut of highlightedNuts) {
@@ -259,6 +480,17 @@ const MarkdownContent = memo(function MarkdownContent({
           const existing = allNutsToMark.find(x => x.nut.id === nut.id);
           if (!existing) {
             allNutsToMark.push({ nut, type: 'pending' });
+          }
+        }
+      }
+    }
+
+    if (focusNutIds && focusNutIds.size > 0) {
+      for (const nut of highlightedNuts) {
+        if (focusNutIds.has(nut.id)) {
+          const existing = allNutsToMark.find(x => x.nut.id === nut.id);
+          if (!existing) {
+            allNutsToMark.push({ nut, type: 'focus' });
           }
         }
       }
@@ -284,18 +516,35 @@ const MarkdownContent = memo(function MarkdownContent({
       })
       .sort((a, b) => b.localSeek - a.localSeek);
 
-    for (const { nut, type, localSeek, localEndSeek } of marks) {
+    const markPlaceholders: Array<{ open: string; close: string; htmlOpen: string }> = [];
+    for (const [index, { nut, type, localSeek, localEndSeek }] of marks.entries()) {
       if (localSeek < 0 || localEndSeek > processedContent.length || localSeek >= localEndSeek) continue;
 
-      const className = type === 'collapsed' ? 'nut-collapsed' : type === 'pending' ? 'nut-pending' : 'nut-highlight';
-      const dataAttr = `data-nut-id="${nut.id}"`;
+      const className = type === 'collapsed'
+        ? 'nut-collapsed'
+        : type === 'pending'
+          ? 'nut-pending'
+          : type === 'focus'
+            ? 'nut-focus-anchor'
+            : 'nut-highlight';
+      const dataAttr = `data-nut-id="${escapeAttr(nut.id)}"`;
       const clickAttr = type === 'collapsed' ? 'data-nut-collapsed="true"' : '';
+      const focusAttr = type === 'focus' ? 'data-nut-focus="true" role="link" tabindex="0"' : '';
 
+      // HTML inserted directly into Markdown source is escaped inside code blocks.
+      // Plain-text sentinels survive Markdown parsing and are restored afterwards.
+      const open = `MEGAFORMNUTOPEN${index}TOKEN`;
+      const close = `MEGAFORMNUTCLOSE${index}TOKEN`;
+      markPlaceholders.push({
+        open,
+        close,
+        htmlOpen: `<span class="${className}" ${dataAttr} ${clickAttr} ${focusAttr}>`,
+      });
       processedContent =
         processedContent.slice(0, localSeek) +
-        `<span class="${className}" ${dataAttr} ${clickAttr}>` +
+        open +
         processedContent.slice(localSeek, localEndSeek) +
-        '</span>' +
+        close +
         processedContent.slice(localEndSeek);
     }
 
@@ -304,11 +553,27 @@ const MarkdownContent = memo(function MarkdownContent({
       const markdownHtml = inline
         ? marked.parseInline(latexRendered.content, { renderer: markdownRenderer }) as string
         : marked.parse(latexRendered.content, { renderer: markdownRenderer }) as string;
-      return restoreLatexPlaceholders(markdownHtml, latexRendered.html);
+      let restored = restoreLatexPlaceholders(markdownHtml, latexRendered.html);
+      for (const placeholder of markPlaceholders) {
+        restored = restored
+          .split(placeholder.open).join(placeholder.htmlOpen)
+          .split(placeholder.close).join('</span>');
+      }
+      return inline || streaming ? restored : annotateImplicitCaptions(restored);
     } catch {
       return inline ? processedContent : `<p>${processedContent}</p>`;
     }
-  }, [debouncedContent, contentOffset, highlightedNuts, hoveredNutId, collapsedNutIds, pendingNutIds, inline]);
+  }, [
+    debouncedContent,
+    contentOffset,
+    highlightedNuts,
+    hoveredNutId,
+    collapsedNutIds,
+    pendingNutIds,
+    focusNutIds,
+    inline,
+    streaming,
+  ]);
 
   // ── 代码块增强 ──
   // wrapper 由 marked renderer 直接生成；这里只负责 highlight.js 语法高亮。
@@ -335,7 +600,14 @@ const MarkdownContent = memo(function MarkdownContent({
         // 跳过正在流式中的最后一个开放代码块（不抖动的关键）
         if (hasOpenBlock && i === codeBlocks.length - 1) return;
         try {
+          const referenceMarks = captureCodeReferenceMarks(block);
+          if (referenceMarks.length > 0) {
+            // highlight.js rejects/replaces pre-existing markup. Highlight the plain
+            // code first, then restore reference spans over its generated token DOM.
+            block.textContent = block.textContent || '';
+          }
           hljs.highlightElement(block);
+          restoreCodeReferenceMarks(block, referenceMarks);
         } catch {
           // 不支持的语言跳过
         }
@@ -387,6 +659,173 @@ const MarkdownContent = memo(function MarkdownContent({
       textNode = walker.nextNode() as Text | null;
     }
   }, [html, searchQuery, searchHitId]);
+
+  const scheduleFocusedImageTransform = useCallback(() => {
+    if (focusedImageFrameRef.current !== null) return;
+
+    focusedImageFrameRef.current = requestAnimationFrame(() => {
+      focusedImageFrameRef.current = null;
+      const image = focusedImageElementRef.current;
+      if (image) {
+        const { x, y } = focusedImageOffsetRef.current;
+        image.style.transform = `translate3d(${x}px, ${y}px, 0) scale(${focusedImageScaleRef.current})`;
+      }
+    });
+  }, []);
+
+  const scheduleFocusedImageScale = useCallback((scale: number) => {
+    focusedImageScaleRef.current = clampFocusedImageScale(scale);
+    scheduleFocusedImageTransform();
+  }, [scheduleFocusedImageTransform]);
+
+  const stopFocusedImageDrag = useCallback((pointerId?: number) => {
+    const drag = focusedImageDragRef.current;
+    if (!drag || (pointerId !== undefined && drag.pointerId !== pointerId)) return;
+
+    const image = focusedImageElementRef.current;
+    if (image?.hasPointerCapture(drag.pointerId)) {
+      image.releasePointerCapture(drag.pointerId);
+    }
+    image?.classList.remove('is-dragging');
+    focusedImageDragRef.current = null;
+  }, []);
+
+  const closeFocusedImage = useCallback(() => {
+    stopFocusedImageDrag();
+    pinchGestureRef.current = null;
+    focusedImageScaleRef.current = 1;
+    focusedImageOffsetRef.current = { x: 0, y: 0 };
+    if (focusedImageFrameRef.current !== null) {
+      cancelAnimationFrame(focusedImageFrameRef.current);
+      focusedImageFrameRef.current = null;
+    }
+    setFocusedImage(null);
+  }, [stopFocusedImageDrag]);
+
+  useEffect(() => () => {
+    if (focusedImageFrameRef.current !== null) {
+      cancelAnimationFrame(focusedImageFrameRef.current);
+    }
+  }, []);
+
+  // ── 图片聚焦层：Esc 关闭，并在打开期间锁定页面背景滚动 ──
+  useEffect(() => {
+    if (!focusedImage) return;
+
+    const previousOverflow = document.body.style.overflow;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') closeFocusedImage();
+    };
+
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [focusedImage, closeFocusedImage]);
+
+  const handleFocusedImageWheel = useCallback((event: React.WheelEvent) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const boundedDelta = Math.max(-120, Math.min(120, event.deltaY));
+    const scaleFactor = Math.exp(-boundedDelta * 0.0015);
+    scheduleFocusedImageScale(focusedImageScaleRef.current * scaleFactor);
+  }, [scheduleFocusedImageScale]);
+
+  const handleFocusedImageTouchStart = useCallback((event: React.TouchEvent) => {
+    if (event.touches.length !== 2) return;
+    stopFocusedImageDrag();
+    const distance = getTouchDistance(event.touches);
+    if (distance <= 0) return;
+    event.preventDefault();
+    pinchGestureRef.current = { distance, scale: focusedImageScaleRef.current };
+  }, [stopFocusedImageDrag]);
+
+  const handleFocusedImageTouchMove = useCallback((event: React.TouchEvent) => {
+    const gesture = pinchGestureRef.current;
+    if (!gesture || event.touches.length !== 2) return;
+    const distance = getTouchDistance(event.touches);
+    if (distance <= 0) return;
+    event.preventDefault();
+    scheduleFocusedImageScale(gesture.scale * distance / gesture.distance);
+  }, [scheduleFocusedImageScale]);
+
+  const handleFocusedImageTouchEnd = useCallback((event: React.TouchEvent) => {
+    if (event.touches.length < 2) pinchGestureRef.current = null;
+  }, []);
+
+  const handleFocusedImagePointerDown = useCallback((event: React.PointerEvent<HTMLImageElement>) => {
+    if (!event.isPrimary || (event.pointerType === 'mouse' && event.button !== 0)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    const { x, y } = focusedImageOffsetRef.current;
+    focusedImageDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      originX: x,
+      originY: y,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    event.currentTarget.classList.add('is-dragging');
+  }, []);
+
+  const handleFocusedImagePointerMove = useCallback((event: React.PointerEvent<HTMLImageElement>) => {
+    const drag = focusedImageDragRef.current;
+    if (!drag || drag.pointerId !== event.pointerId || pinchGestureRef.current) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    focusedImageOffsetRef.current = {
+      x: drag.originX + event.clientX - drag.startX,
+      y: drag.originY + event.clientY - drag.startY,
+    };
+    scheduleFocusedImageTransform();
+  }, [scheduleFocusedImageTransform]);
+
+  const handleFocusedImagePointerEnd = useCallback((event: React.PointerEvent<HTMLImageElement>) => {
+    stopFocusedImageDrag(event.pointerId);
+  }, [stopFocusedImageDrag]);
+
+  const handleDoubleClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const target = event.target as HTMLElement;
+    const focusNut = target.closest<HTMLElement>('.nut-focus-anchor[data-nut-id]');
+    if (focusNut && event.currentTarget.contains(focusNut)) {
+      const nutId = focusNut.dataset.nutId;
+      if (nutId && onFocusNutOpen) {
+        event.preventDefault();
+        event.stopPropagation();
+        onFocusNutOpen(nutId);
+      }
+      return;
+    }
+
+    const image = target.closest<HTMLImageElement>('img');
+    if (!image || !event.currentTarget.contains(image)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    focusedImageScaleRef.current = 1;
+    focusedImageOffsetRef.current = { x: 0, y: 0 };
+    setFocusedImage({
+      src: image.currentSrc || image.src,
+      alt: image.alt || '',
+    });
+  }, [onFocusNutOpen]);
+
+  const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLElement>) => {
+    if (event.key !== 'Enter') return;
+    const target = event.target as HTMLElement;
+    const focusNut = target.closest<HTMLElement>('.nut-focus-anchor[data-nut-id]');
+    if (!focusNut || !event.currentTarget.contains(focusNut)) return;
+    const nutId = focusNut.dataset.nutId;
+    if (!nutId || !onFocusNutOpen) return;
+    event.preventDefault();
+    event.stopPropagation();
+    onFocusNutOpen(nutId);
+  }, [onFocusNutOpen]);
 
   // ── 事件委托: 折叠 nut 点击 + 复制按钮点击 ──
   const handleClick = useCallback((e: React.MouseEvent) => {
@@ -446,19 +885,70 @@ const MarkdownContent = memo(function MarkdownContent({
         data-markdown-length={debouncedContent.length}
         dangerouslySetInnerHTML={{ __html: html }}
         onClick={handleClick}
+        onKeyDown={handleKeyDown}
       />
     );
   }
 
   return (
-    <div
-      ref={containerRef}
-      className={className}
-      data-markdown-offset={contentOffset}
-      data-markdown-length={debouncedContent.length}
-      dangerouslySetInnerHTML={{ __html: html }}
-      onClick={handleClick}
-    />
+    <>
+      <div
+        ref={containerRef}
+        className={className}
+        data-markdown-offset={contentOffset}
+        data-markdown-length={debouncedContent.length}
+        dangerouslySetInnerHTML={{ __html: html }}
+        onClick={handleClick}
+        onDoubleClick={handleDoubleClick}
+        onKeyDown={handleKeyDown}
+      />
+      {focusedImage && createPortal(
+        <div
+          className="markdown-image-lightbox"
+          role="dialog"
+          aria-modal="true"
+          aria-label={focusedImage.alt || 'Focused image'}
+          onClick={closeFocusedImage}
+          onWheel={handleFocusedImageWheel}
+        >
+          <button
+            type="button"
+            className="markdown-image-lightbox-close"
+            aria-label="Close image"
+            onClick={closeFocusedImage}
+            autoFocus
+          >
+            ×
+          </button>
+          <figure
+            className="markdown-image-lightbox-figure"
+            onClick={event => event.stopPropagation()}
+            onTouchStart={handleFocusedImageTouchStart}
+            onTouchMove={handleFocusedImageTouchMove}
+            onTouchEnd={handleFocusedImageTouchEnd}
+            onTouchCancel={handleFocusedImageTouchEnd}
+          >
+            <img
+              ref={focusedImageElementRef}
+              className="markdown-image-lightbox-image"
+              src={focusedImage.src}
+              alt={focusedImage.alt}
+              draggable={false}
+              onPointerDown={handleFocusedImagePointerDown}
+              onPointerMove={handleFocusedImagePointerMove}
+              onPointerUp={handleFocusedImagePointerEnd}
+              onPointerCancel={handleFocusedImagePointerEnd}
+            />
+            {focusedImage.alt && (
+              <figcaption className="markdown-image-lightbox-caption">
+                {focusedImage.alt}
+              </figcaption>
+            )}
+          </figure>
+        </div>,
+        document.body,
+      )}
+    </>
   );
 }, (prevProps, nextProps) => {
   return prevProps.content === nextProps.content
@@ -470,7 +960,9 @@ const MarkdownContent = memo(function MarkdownContent({
     && prevProps.inline === nextProps.inline
     && nutsEqual(prevProps.highlightedNuts, nextProps.highlightedNuts)
     && setEquals(prevProps.collapsedNutIds, nextProps.collapsedNutIds)
-    && setEquals(prevProps.pendingNutIds, nextProps.pendingNutIds);
+    && setEquals(prevProps.pendingNutIds, nextProps.pendingNutIds)
+    && setEquals(prevProps.focusNutIds, nextProps.focusNutIds)
+    && prevProps.onFocusNutOpen === nextProps.onFocusNutOpen;
 });
 
 export default MarkdownContent;

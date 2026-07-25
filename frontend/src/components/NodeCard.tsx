@@ -37,6 +37,9 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
   const toggleCollapse = useAppStore(s => s.toggleCollapse);       // 折叠/展开切换
   const setDescendantsCollapse = useAppStore(s => s.setDescendantsCollapse); // 递归折叠/展开
   const toggleImmersive = useAppStore(s => s.toggleImmersive);     // 沉浸式浏览切换
+  const focusReadingNodeId = useAppStore(s => s.focusReadingNodeId);
+  const setFocusReadingNode = useAppStore(s => s.setFocusReadingNode);
+  const focusedNodeId = useAppStore(s => s.focusedNodeId);
   const focusNode = useAppStore(s => s.focusNode);                 // 全局聚焦节点
   const getNodeById = useAppStore(s => s.getNodeById);             // 根据 ID 查找节点
   const models = useAppStore(s => s.models);                       // 模型列表
@@ -55,6 +58,8 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
   // hideResponses：是否隐藏回复区域
   const hideResponses = selfCollapsed;
   const isImmersive = immersiveHiddenSet.has(node.id);            // 沉浸式浏览态
+  const isFocusReading = focusReadingNodeId === node.id;
+  const focusReadingActive = Boolean(focusReadingNodeId);
   const meta = JSON.parse(node.meta || '{}');                     // 节点元数据
   const hasChildren = node.children && node.children.length > 0;   // 是否有子节点
   const hasResponses = node.responses && node.responses.length > 0; // 是否有回复
@@ -174,8 +179,8 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
 
   // ────── 子节点分类 ──────
   // 区分 followup（追问）和 progression（推演）子节点
-  // 沉浸式浏览时隐藏所有 followup 子节点，只显示回答内容
-  const followupChildren = isImmersive
+  // 沉浸式浏览时隐藏所有 followup；专注阅读仍需保留数据以标记原文锚点。
+  const followupChildren = isImmersive && !focusReadingActive
     ? []
     : (node.children || []).filter(c => c.relation === 'followup');
   // 折叠时追问子节点不从 ResponseArea 内联渲染，而是独立排列在卡片下方
@@ -486,6 +491,18 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
     focusNode(node.id);
   };
 
+  /** handleToggleFocusReading — 聚焦当前节点并切换全局阅读布局 */
+  const handleToggleFocusReading = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setMenuOpen(false);
+    if (isFocusReading) {
+      setFocusReadingNode(null);
+      return;
+    }
+    focusNode(node.id);
+    setFocusReadingNode(node.id);
+  };
+
   /** handleMenuToggleCollapse — 从菜单切换当前节点折叠状态 */
   const handleMenuToggleCollapse = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -687,9 +704,17 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
                         zIndex: 10000,
                       }}
                     >
-                      {/* 聚焦当前节点 */}
-                      <button className="menu-item" onClick={handleFocusNode}>
-                        <Crosshair size={14} /> {t('focusNode')}
+                      {/* 当前节点已经全局聚焦时，无需重复显示聚焦操作 */}
+                      {focusedNodeId !== node.id && (
+                        <button className="menu-item" onClick={handleFocusNode}>
+                          <Crosshair size={14} /> {t('focusNode')}
+                        </button>
+                      )}
+                      <button
+                        className={`menu-item ${isFocusReading ? 'menu-item-active' : ''}`}
+                        onClick={handleToggleFocusReading}
+                      >
+                        <BookOpenText size={14} /> {isFocusReading ? t('exitFocusReading') : t('focusReading')}
                       </button>
                       {/* 折叠当前节点 */}
                       <button className="menu-item" onClick={handleMenuToggleCollapse} disabled={!canCollapse}>
@@ -786,6 +811,7 @@ export default function NodeCard({ node, depth, suppressEnterAnimation = false }
                       responses={responses}
                       followupChildren={responseFollowupChildren}
                       immersive={isImmersive}
+                      focusReading={focusReadingActive}
                       streamingResponses={hasStreamingResponses ? nodeStreamingResponses : undefined}
                       isStreamingNode={isStreaming}
                       suppressModelChipAnimation={suppressEnterAnimation}

@@ -423,6 +423,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS root_groups (
             id              TEXT PRIMARY KEY,
             user_id         TEXT NOT NULL DEFAULT 'local-user' REFERENCES users(id) ON DELETE CASCADE,
+            parent_id       TEXT REFERENCES root_groups(id) ON DELETE CASCADE,
             name            TEXT NOT NULL,
             sort_order      INTEGER NOT NULL DEFAULT 0,
             collapsed       INTEGER DEFAULT 0,
@@ -716,6 +717,7 @@ def migrate_schema():
             CREATE TABLE IF NOT EXISTS root_groups (
                 id              TEXT PRIMARY KEY,
                 user_id         TEXT NOT NULL DEFAULT 'local-user' REFERENCES users(id) ON DELETE CASCADE,
+                parent_id       TEXT REFERENCES root_groups(id) ON DELETE CASCADE,
                 name            TEXT NOT NULL,
                 sort_order      INTEGER NOT NULL DEFAULT 0,
                 collapsed       INTEGER DEFAULT 0,
@@ -723,6 +725,10 @@ def migrate_schema():
                 updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        group_cols = _columns(conn, "root_groups")
+        if group_cols and "parent_id" not in group_cols:
+            conn.execute("ALTER TABLE root_groups ADD COLUMN parent_id TEXT REFERENCES root_groups(id) ON DELETE CASCADE")
+            log.info("迁移: root_groups 新增 parent_id 字段")
 
         user_cols = _columns(conn, "users")
         if user_cols and "password_hash" not in user_cols:
@@ -1219,6 +1225,58 @@ def save_user_profile(content: str, user_id: str = LOCAL_USER_ID, note: str = ""
     return dict(row)
 
 
+def save_user_profile_if_version(
+    content: str,
+    expected_version_id: str | None,
+    user_id: str = LOCAL_USER_ID,
+    note: str = "",
+) -> Optional[dict]:
+    """Save only when the profile has not changed since it was read."""
+    conn = get_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM user_profiles WHERE user_id=?", (user_id,)
+        ).fetchone()
+        current_version_id = existing["current_version_id"] if existing else None
+        if current_version_id != expected_version_id:
+            conn.rollback()
+            return None
+
+        normalized = content or ""
+        if existing and (existing["content"] or "") == normalized:
+            conn.commit()
+            return dict(existing)
+
+        now = _now()
+        version_id = new_id()
+        conn.execute(
+            """INSERT INTO user_profile_versions (id, user_id, content, note, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (version_id, user_id, normalized, note or "手动保存", now),
+        )
+        if existing:
+            conn.execute(
+                """UPDATE user_profiles
+                   SET content=?, current_version_id=?, updated_at=?
+                   WHERE user_id=?""",
+                (normalized, version_id, now, user_id),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO user_profiles
+                   (user_id, content, current_version_id, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (user_id, normalized, version_id, now, now),
+            )
+        _trim_user_profile_versions(conn, user_id)
+        conn.commit()
+        row = conn.execute("SELECT * FROM user_profiles WHERE user_id=?", (user_id,)).fetchone()
+        return dict(row)
+    finally:
+        conn.close()
+
+
 def list_user_profile_versions(user_id: str = LOCAL_USER_ID, limit: int = 50) -> list[dict]:
     conn = get_db()
     _trim_user_profile_versions(conn, user_id)
@@ -1271,30 +1329,103 @@ def get_all_roots(user_id: str | None = LOCAL_USER_ID) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_roots_page(
+    user_id: str = LOCAL_USER_ID,
+    limit: int = 120,
+    updated_after: str | None = None,
+    cursor_updated_at: str | None = None,
+    cursor_id: str | None = None,
+) -> dict:
+    """分页获取问题树根节点，按更新时间倒序。"""
+    page_size = max(1, min(int(limit or 120), 500))
+    conn = get_db()
+    where = ["root.parent_id IS NULL", "root.user_id=?"]
+    params: list = [user_id]
+    if updated_after:
+        where.append("root.updated_at >= ?")
+        params.append(updated_after)
+    if cursor_updated_at and cursor_id:
+        where.append("(root.updated_at < ? OR (root.updated_at = ? AND root.id < ?))")
+        params.extend([cursor_updated_at, cursor_updated_at, cursor_id])
+
+    rows = conn.execute(
+        f"""SELECT root.*, COUNT(child.id) AS node_count
+           FROM nodes AS root
+           LEFT JOIN nodes AS child ON child.root_id = root.id AND child.user_id = root.user_id
+           WHERE {' AND '.join(where)}
+           GROUP BY root.id
+           ORDER BY root.updated_at DESC, root.id DESC
+           LIMIT ?"""
+        , [*params, page_size + 1]
+    ).fetchall()
+    conn.close()
+
+    has_more = len(rows) > page_size
+    page_rows = rows[:page_size]
+    next_cursor = None
+    if has_more and page_rows:
+        last = page_rows[-1]
+        next_cursor = f"{last['updated_at']}|{last['id']}"
+    elif updated_after:
+        if page_rows:
+            last = page_rows[-1]
+            probe_updated_at = last["updated_at"]
+            probe_id = last["id"]
+        else:
+            probe_updated_at = updated_after
+            probe_id = "~"
+        conn = get_db()
+        older = conn.execute(
+            """SELECT 1
+               FROM nodes AS root
+               WHERE root.parent_id IS NULL
+                 AND root.user_id=?
+                 AND (root.updated_at < ? OR (root.updated_at = ? AND root.id < ?))
+               LIMIT 1""",
+            (user_id, probe_updated_at, probe_updated_at, probe_id),
+        ).fetchone()
+        conn.close()
+        if older:
+            has_more = True
+            next_cursor = f"{probe_updated_at}|{probe_id}"
+    return {
+        "roots": [dict(r) for r in page_rows],
+        "next_cursor": next_cursor,
+        "has_more": has_more,
+    }
+
+
 def get_root_groups(user_id: str = LOCAL_USER_ID) -> list[dict]:
     conn = get_db()
     rows = conn.execute(
-        "SELECT * FROM root_groups WHERE user_id=? ORDER BY sort_order, created_at",
+        "SELECT * FROM root_groups WHERE user_id=? ORDER BY parent_id IS NOT NULL, parent_id, sort_order, created_at",
         (user_id,),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def create_root_group(name: str, user_id: str = LOCAL_USER_ID) -> dict:
+def create_root_group(name: str, user_id: str = LOCAL_USER_ID, parent_id: str | None = None) -> dict:
     conn = get_db()
+    if parent_id:
+        parent = conn.execute(
+            "SELECT id FROM root_groups WHERE id=? AND user_id=?",
+            (parent_id, user_id),
+        ).fetchone()
+        if not parent:
+            parent_id = None
     gid = new_id()
     now = _now()
     row = conn.execute(
-        "SELECT MAX(sort_order) AS m FROM root_groups WHERE user_id=?",
-        (user_id,),
+        "SELECT MAX(sort_order) AS m FROM root_groups WHERE user_id=? AND parent_id IS ?",
+        (user_id, parent_id),
     ).fetchone()
     sort_order = (row["m"] if row and row["m"] is not None else -1) + 1
     conn.execute(
         """INSERT INTO root_groups
-           (id, user_id, name, sort_order, collapsed, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 0, ?, ?)""",
-        (gid, user_id, name.strip() or "未命名分组", sort_order, now, now),
+           (id, user_id, parent_id, name, sort_order, collapsed, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, 0, ?, ?)""",
+        (gid, user_id, parent_id, name.strip() or "未命名分组", sort_order, now, now),
     )
     conn.commit()
     group = conn.execute("SELECT * FROM root_groups WHERE id=? AND user_id=?", (gid, user_id)).fetchone()
@@ -1303,7 +1434,7 @@ def create_root_group(name: str, user_id: str = LOCAL_USER_ID) -> dict:
 
 
 def update_root_group(group_id: str, user_id: str = LOCAL_USER_ID, **data) -> Optional[dict]:
-    allowed = {"name", "sort_order", "collapsed"}
+    allowed = {"name", "sort_order", "collapsed", "parent_id"}
     updates = {k: v for k, v in data.items() if k in allowed}
     if not updates:
         return get_root_group(group_id, user_id=user_id)
@@ -1313,6 +1444,31 @@ def update_root_group(group_id: str, user_id: str = LOCAL_USER_ID, **data) -> Op
         updates["collapsed"] = 1 if updates["collapsed"] else 0
 
     conn = get_db()
+    if "parent_id" in updates:
+        parent_id = updates["parent_id"] or None
+        if parent_id == group_id:
+            conn.close()
+            return get_root_group(group_id, user_id=user_id)
+        if parent_id:
+            parent = conn.execute(
+                "SELECT id FROM root_groups WHERE id=? AND user_id=?",
+                (parent_id, user_id),
+            ).fetchone()
+            if not parent:
+                parent_id = None
+            else:
+                queue = [parent_id]
+                while queue:
+                    current = queue.pop(0)
+                    if current == group_id:
+                        conn.close()
+                        return get_root_group(group_id, user_id=user_id)
+                    children = conn.execute(
+                        "SELECT id FROM root_groups WHERE parent_id=? AND user_id=?",
+                        (current, user_id),
+                    ).fetchall()
+                    queue.extend(child["id"] for child in children)
+        updates["parent_id"] = parent_id
     sets = ", ".join([f"{k}=?" for k in updates.keys()])
     vals = list(updates.values()) + [_now(), group_id, user_id]
     conn.execute(
@@ -1323,6 +1479,28 @@ def update_root_group(group_id: str, user_id: str = LOCAL_USER_ID, **data) -> Op
     row = conn.execute("SELECT * FROM root_groups WHERE id=? AND user_id=?", (group_id, user_id)).fetchone()
     conn.close()
     return dict(row) if row else None
+
+
+def get_root_group_descendant_ids(group_id: str, user_id: str = LOCAL_USER_ID) -> list[str]:
+    conn = get_db()
+    ids: list[str] = []
+    queue = [group_id]
+    while queue:
+        current = queue.pop(0)
+        row = conn.execute(
+            "SELECT id FROM root_groups WHERE id=? AND user_id=?",
+            (current, user_id),
+        ).fetchone()
+        if not row or current in ids:
+            continue
+        ids.append(current)
+        children = conn.execute(
+            "SELECT id FROM root_groups WHERE parent_id=? AND user_id=?",
+            (current, user_id),
+        ).fetchall()
+        queue.extend(child["id"] for child in children)
+    conn.close()
+    return ids
 
 
 def get_root_group(group_id: str, user_id: str = LOCAL_USER_ID) -> Optional[dict]:
@@ -1338,11 +1516,13 @@ def delete_root_group(group_id: str, user_id: str = LOCAL_USER_ID) -> bool:
     if not exists:
         conn.close()
         return False
+    group_ids = get_root_group_descendant_ids(group_id, user_id=user_id)
+    placeholders = ",".join("?" for _ in group_ids)
     conn.execute(
-        "UPDATE nodes SET group_id=NULL, group_order=NULL WHERE user_id=? AND parent_id IS NULL AND group_id=?",
-        (user_id, group_id),
+        f"UPDATE nodes SET group_id=NULL, group_order=NULL WHERE user_id=? AND parent_id IS NULL AND group_id IN ({placeholders})",
+        [user_id, *group_ids],
     )
-    conn.execute("DELETE FROM root_groups WHERE id=? AND user_id=?", (group_id, user_id))
+    conn.execute(f"DELETE FROM root_groups WHERE user_id=? AND id IN ({placeholders})", [user_id, *group_ids])
     conn.commit()
     conn.close()
     return True
@@ -1506,13 +1686,13 @@ def get_nodes_created_between(
 ) -> list[dict]:
     conn = get_db()
     rows = conn.execute(
-        """SELECT id, root_id, parent_id, content, summary, created_at
-           FROM nodes
-           WHERE user_id=?
-             AND created_at>=?
-             AND created_at<?
-           ORDER BY created_at
-           LIMIT ?""",
+        """SELECT * FROM (
+               SELECT id, root_id, parent_id, content, summary, created_at
+                 FROM nodes
+                WHERE user_id=? AND created_at>=? AND created_at<?
+                ORDER BY created_at DESC
+                LIMIT ?
+           ) ORDER BY created_at""",
         (user_id, start_at, end_at, max(1, min(int(limit or 200), 1000))),
     ).fetchall()
     conn.close()

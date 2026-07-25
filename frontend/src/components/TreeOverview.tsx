@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { LocateFixed, Minus, Plus } from 'lucide-react';
+import { AlignLeft, LocateFixed, Minus, Plus } from 'lucide-react';
 import type { Node } from '../types';
 import { useT } from '../i18n';
 import ReferencePreview from './ReferencePreview';
@@ -46,6 +46,8 @@ interface PositionedEdge {
   isInFocusPath: boolean;
   anchorX: number;
   anchorY: number;
+  branchX: number;
+  branchY: number;
   targetX: number;
   targetY: number;
 }
@@ -78,6 +80,11 @@ interface PinchStart {
   panY: number;
 }
 
+interface BranchWeight {
+  left: number;
+  right: number;
+}
+
 const VIEWPORT_FALLBACK_WIDTH = 960;
 const CANVAS_MARGIN = 120;
 const TRUNK_WIDTH = 430;
@@ -87,14 +94,23 @@ const MAIN_HEIGHT = 62;
 const BRANCH_HEIGHT = 62;
 const ROW_TOP = 52;
 const ROW_GAP = 88;
+const ROW_VERTICAL_GAP = ROW_GAP - MAIN_HEIGHT;
+const ROW_CAPACITY = 2;
+const ROW_NODE_MIN_GAP = 28;
+const FULL_TEXT_MAIN_LINE_HEIGHT = 21.6;
+const FULL_TEXT_REFERENCE_LINE_HEIGHT = 15;
+const FULL_TEXT_META_HEIGHT = 14;
+const FULL_TEXT_LABEL_PADDING_Y = 8;
+const FULL_TEXT_LABEL_GAP = 3;
 const SIDE_OFFSET_BASE = 300;
 const SIDE_OFFSET_STEP = 42;
-const SIDE_OFFSET_MIN = 150;
+const SIDE_OFFSET_MIN = 80;
 const SIDE_OFFSET_HEIGHT_DECAY = 130;
 const REVERSE_BRANCH_OFFSET_FACTOR = 0.68;
 const RAIL_DOT_OFFSET = 11;
 const FOLLOWUP_BRANCH_OFFSET = 42;
 const FOLLOWUP_BRANCH_STEP = 38;
+const FOLLOWUP_SAME_SIDE_INSET_STEP = 52;
 const FOLLOWUP_SHELF_SLOPE = 0.035;
 const RAIL_EXTENSION_AFTER_LAST_DOT = 34;
 const BRANCH_RAIL_AFTER_LAST_FOLLOWUP_DOT = 28;
@@ -106,13 +122,49 @@ function clamp(n: number, min: number, max: number) {
   return Math.min(max, Math.max(min, n));
 }
 
+function normalizeOverviewText(text: string) {
+  return text.trim().replace(/\s+/g, ' ');
+}
+
 function truncate(text: string, maxLen: number) {
-  const chars = Array.from(text.trim().replace(/\s+/g, ' '));
+  const chars = Array.from(normalizeOverviewText(text));
   return chars.length > maxLen ? `${chars.slice(0, maxLen).join('')}...` : chars.join('');
 }
 
-function getNodeLabel(node: Node, relation: 'progression' | 'followup') {
-  return truncate(node.summary || node.content || '', relation === 'followup' ? 42 : 58);
+function getNodeLabel(node: Node, relation: 'progression' | 'followup', showFullText: boolean) {
+  const text = node.summary || node.content || '';
+  if (showFullText) return normalizeOverviewText(text);
+  return truncate(text, relation === 'followup' ? 42 : 58);
+}
+
+function getWeightedTextLength(text: string) {
+  return Array.from(text).reduce((total, char) => total + (char.charCodeAt(0) <= 0x7f ? 0.56 : 1), 0);
+}
+
+function estimateLineCount(text: string, width: number, fontSize: number) {
+  if (!text.trim()) return 0;
+  const charsPerLine = Math.max(8, Math.floor(width / fontSize));
+  return Math.max(1, Math.ceil(getWeightedTextLength(text) / charsPerLine));
+}
+
+function estimateNodeHeight(
+  label: string,
+  quote: string | null,
+  width: number,
+  fallbackHeight: number,
+  showFullText: boolean,
+) {
+  if (!showFullText) return fallbackHeight;
+  const labelWidth = Math.max(120, width - 48);
+  const quoteLines = quote ? estimateLineCount(quote, labelWidth, 12) : 0;
+  const mainLines = Math.max(1, estimateLineCount(label, labelWidth, 16));
+  const textHeight =
+    FULL_TEXT_LABEL_PADDING_Y * 2
+    + quoteLines * FULL_TEXT_REFERENCE_LINE_HEIGHT
+    + mainLines * FULL_TEXT_MAIN_LINE_HEIGHT
+    + FULL_TEXT_META_HEIGHT
+    + FULL_TEXT_LABEL_GAP * (quoteLines > 0 ? 2 : 1);
+  return Math.max(fallbackHeight, Math.ceil(textHeight));
 }
 
 function flatten(nodes: Node[]): Node[] {
@@ -125,6 +177,10 @@ function flatten(nodes: Node[]): Node[] {
   };
   walk(nodes);
   return result;
+}
+
+function countSubtreeNodes(node: Node): number {
+  return 1 + (node.children || []).reduce((total, child) => total + countSubtreeNodes(child), 0);
 }
 
 function getFollowupSortKey(child: Node, parent: Node) {
@@ -183,13 +239,63 @@ function buildFocusPathIds(allNodes: Node[], focusedNodeId: string | null) {
   return ids;
 }
 
-function buildTreeOverviewLayout(rootTree: Node[], viewportWidth: number, focusedNodeId: string | null): OverviewLayout {
+function buildTreeOverviewLayout(
+  rootTree: Node[],
+  viewportWidth: number,
+  focusedNodeId: string | null,
+  showFullText = false,
+): OverviewLayout {
   const allNodes = flatten(rootTree);
   const nodeById = new Map(allNodes.map(node => [node.id, node]));
   const focusPathIds = buildFocusPathIds(allNodes, focusedNodeId);
   const positioned: Array<Omit<PositionedNode, 'x'>> = [];
   const edges: Array<Omit<PositionedEdge, 'd'>> = [];
+  const rowOccupancy = new Map<number, Array<{ left: number; right: number }>>();
+  const rowHeights = new Map<number, number>();
   let nextRow = 0;
+
+  const getNodeSpan = (cx: number, width: number, side: Side) => ({
+    left: side === -1 ? cx - width + RAIL_DOT_OFFSET : cx - RAIL_DOT_OFFSET,
+    right: side === -1 ? cx + RAIL_DOT_OFFSET : cx + width - RAIL_DOT_OFFSET,
+  });
+
+  const canUseRow = (row: number, span: { left: number; right: number }) => {
+    const used = rowOccupancy.get(row) || [];
+    if (used.length >= ROW_CAPACITY) return false;
+    return used.every(item => span.right + ROW_NODE_MIN_GAP <= item.left || item.right + ROW_NODE_MIN_GAP <= span.left);
+  };
+
+  const reserveRow = (row: number, span: { left: number; right: number }) => {
+    rowOccupancy.set(row, [...(rowOccupancy.get(row) || []), span]);
+    while ((rowOccupancy.get(nextRow)?.length || 0) >= ROW_CAPACITY) {
+      nextRow += 1;
+    }
+  };
+
+  const getRowTop = (row: number) => {
+    let top = ROW_TOP;
+    for (let i = 0; i < row; i++) {
+      top += (rowHeights.get(i) || MAIN_HEIGHT) + ROW_VERTICAL_GAP;
+    }
+    return top;
+  };
+
+  const getRowForY = (y: number) => {
+    let row = 0;
+    while (getRowTop(row) + (rowHeights.get(row) || MAIN_HEIGHT) < y) row += 1;
+    return row;
+  };
+
+  const addBranchWeight = (weights: BranchWeight, branchSide: Side, weight: number): BranchWeight => {
+    if (branchSide === -1) return { ...weights, left: weights.left + weight };
+    if (branchSide === 1) return { ...weights, right: weights.right + weight };
+    return weights;
+  };
+
+  const getBalancedFirstSide = (weights: BranchWeight, fallbackSide: Side): Side => {
+    if (weights.left === weights.right) return fallbackSide;
+    return weights.left > weights.right ? 1 : -1;
+  };
 
   const addNode = (
     node: Node,
@@ -197,14 +303,22 @@ function buildTreeOverviewLayout(rootTree: Node[], viewportWidth: number, focuse
     depth: number,
     side: Side,
     relation: 'progression' | 'followup',
+    minRow = nextRow,
   ) => {
     const isBranch = relation === 'followup' || side !== 0;
     const width = isBranch
       ? Math.max(BRANCH_WIDTH_MIN, BRANCH_WIDTH - depth * 14)
       : TRUNK_WIDTH;
-    const height = isBranch ? BRANCH_HEIGHT : MAIN_HEIGHT;
-    const y = ROW_TOP + nextRow * ROW_GAP + (MAIN_HEIGHT - height) / 2;
-    nextRow += 1;
+    const fallbackHeight = isBranch ? BRANCH_HEIGHT : MAIN_HEIGHT;
+    const quote = getFollowupQuote(node, nodeById);
+    const label = getNodeLabel(node, relation, showFullText);
+    const height = estimateNodeHeight(label, quote, width, fallbackHeight, showFullText);
+    const span = getNodeSpan(cx, width, side);
+    let row = Math.max(minRow, nextRow);
+    while (!canUseRow(row, span)) row += 1;
+    const y = getRowTop(row);
+    rowHeights.set(row, Math.max(rowHeights.get(row) || MAIN_HEIGHT, height));
+    reserveRow(row, span);
 
     const item = {
       id: node.id,
@@ -216,8 +330,8 @@ function buildTreeOverviewLayout(rootTree: Node[], viewportWidth: number, focuse
       depth,
       side,
       relation,
-      label: getNodeLabel(node, relation),
-      quote: getFollowupQuote(node, nodeById),
+      label,
+      quote,
       responseCount: node.responses?.length || 0,
       childCount: node.children?.length || 0,
       isFocused: node.id === focusedNodeId,
@@ -235,8 +349,10 @@ function buildTreeOverviewLayout(rootTree: Node[], viewportWidth: number, focuse
     relation: 'progression' | 'followup',
     parentId?: string,
     branchIndex = 0,
-  ): number => {
-    const current = addNode(node, cx, depth, side, relation);
+    minRow = nextRow,
+    branchWeight: BranchWeight = { left: 0, right: 0 },
+  ): { bottom: number; branchWeight: BranchWeight } => {
+    const current = addNode(node, cx, depth, side, relation, minRow);
     if (parentId) {
       edges.push({
         id: `${parentId}:${node.id}`,
@@ -249,6 +365,8 @@ function buildTreeOverviewLayout(rootTree: Node[], viewportWidth: number, focuse
         isInFocusPath: focusPathIds.has(parentId) && focusPathIds.has(node.id),
         anchorX: 0,
         anchorY: 0,
+        branchX: 0,
+        branchY: 0,
         targetX: 0,
         targetY: 0,
       });
@@ -269,26 +387,48 @@ function buildTreeOverviewLayout(rootTree: Node[], viewportWidth: number, focuse
       });
     const progressions = children.filter(child => child.relation !== 'followup');
 
-    followups.forEach((child, index) => {
-      const outwardFirst = side === 0 ? -1 : side;
-      const branchSide = (index % 2 === 0 ? outwardFirst : -outwardFirst) as Side;
-      const childRow = nextRow;
-      const heightProgress = allNodes.length > 1 ? childRow / (allNodes.length - 1) : 0;
-      const depthOffset = Math.max(SIDE_OFFSET_MIN, SIDE_OFFSET_BASE - depth * SIDE_OFFSET_STEP);
-      const baseOffset = Math.max(SIDE_OFFSET_MIN, depthOffset - heightProgress * SIDE_OFFSET_HEIGHT_DECAY);
-      const isReverseBranch = side !== 0 && branchSide !== side;
-      const offset = isReverseBranch ? Math.max(SIDE_OFFSET_MIN, baseOffset * REVERSE_BRANCH_OFFSET_FACTOR) : baseOffset;
-      const childCx = cx + branchSide * offset;
-      layoutSubtree(child, childCx, depth + 1, branchSide, 'followup', node.id, index);
-    });
-
     let bottom = current.y + current.height;
-    progressions.forEach(child => {
-      const childBottom = layoutSubtree(child, cx, depth, side, 'progression', node.id, 0);
-      bottom = Math.max(bottom, childBottom);
+    let currentBranchWeight = branchWeight;
+    let pairedHeightProgress = 0;
+    const fallbackFirstSide = side === 0 ? -1 : side;
+    const sameSideLaneCounts: Record<-1 | 1, number> = { [-1]: 0, [1]: 0 };
+    followups.forEach((child, index) => {
+      const fallbackBranchSide = (index % 2 === 0 ? fallbackFirstSide : -fallbackFirstSide) as Side;
+      const branchSide = getBalancedFirstSide(currentBranchWeight, fallbackBranchSide) as -1 | 1;
+      const sideLaneIndex = sameSideLaneCounts[branchSide];
+      sameSideLaneCounts[branchSide] += 1;
+      const parentCenterY = current.y + current.height * 0.5;
+      const branchStartY = parentCenterY + FOLLOWUP_BRANCH_OFFSET + index * FOLLOWUP_BRANCH_STEP;
+      let minChildRow = Math.max(nextRow, getRowForY(branchStartY + 8));
+      pairedHeightProgress = allNodes.length > 1 ? minChildRow / (allNodes.length - 1) : 0;
+      const depthOffset = Math.max(SIDE_OFFSET_MIN, SIDE_OFFSET_BASE - depth * SIDE_OFFSET_STEP);
+      let baseOffset = Math.max(SIDE_OFFSET_MIN, depthOffset - pairedHeightProgress * SIDE_OFFSET_HEIGHT_DECAY);
+      const isReverseBranch = side !== 0 && branchSide !== side;
+      let offset = isReverseBranch ? Math.max(SIDE_OFFSET_MIN, baseOffset * REVERSE_BRANCH_OFFSET_FACTOR) : baseOffset;
+      offset = Math.max(SIDE_OFFSET_MIN, offset - sideLaneIndex * FOLLOWUP_SAME_SIDE_INSET_STEP);
+      const horizontal = Math.abs(offset);
+      const cornerRadius = Math.max(22, Math.min(34, horizontal * 0.12));
+      const verticalStartY = branchStartY + horizontal * FOLLOWUP_SHELF_SLOPE + cornerRadius;
+      minChildRow = Math.max(minChildRow, getRowForY(verticalStartY + 2));
+      pairedHeightProgress = allNodes.length > 1 ? minChildRow / (allNodes.length - 1) : 0;
+      baseOffset = Math.max(SIDE_OFFSET_MIN, depthOffset - pairedHeightProgress * SIDE_OFFSET_HEIGHT_DECAY);
+      offset = isReverseBranch ? Math.max(SIDE_OFFSET_MIN, baseOffset * REVERSE_BRANCH_OFFSET_FACTOR) : baseOffset;
+      offset = Math.max(SIDE_OFFSET_MIN, offset - sideLaneIndex * FOLLOWUP_SAME_SIDE_INSET_STEP);
+      const childCx = cx + branchSide * offset;
+      const childLayout = layoutSubtree(child, childCx, depth + 1, branchSide, 'followup', node.id, index, minChildRow);
+      currentBranchWeight = addBranchWeight(currentBranchWeight, branchSide, countSubtreeNodes(child));
+      bottom = Math.max(bottom, childLayout.bottom);
     });
 
-    return bottom;
+    let progressionMinRow = Math.max(getRowForY(current.y + current.height * 0.5) + 1, getRowForY(bottom));
+    progressions.forEach(child => {
+      const childLayout = layoutSubtree(child, cx, depth, side, 'progression', node.id, 0, progressionMinRow, currentBranchWeight);
+      currentBranchWeight = childLayout.branchWeight;
+      bottom = Math.max(bottom, childLayout.bottom);
+      progressionMinRow = Math.max(progressionMinRow, getRowForY(childLayout.bottom));
+    });
+
+    return { bottom, branchWeight: currentBranchWeight };
   };
 
   const root = rootTree[0];
@@ -331,6 +471,8 @@ function buildTreeOverviewLayout(rootTree: Node[], viewportWidth: number, focuse
         ...edge,
         anchorX: startX,
         anchorY: startY,
+        branchX: startX,
+        branchY: startY,
         targetX: endX,
         targetY: endY,
         d: `M ${startX} ${startY} L ${endX} ${endY}`,
@@ -347,11 +489,13 @@ function buildTreeOverviewLayout(rootTree: Node[], viewportWidth: number, focuse
     const cornerRadius = Math.max(22, Math.min(34, horizontal * 0.12));
     const shelfY = startY + horizontal * FOLLOWUP_SHELF_SLOPE;
     const preCornerX = endX - sideSign * cornerRadius;
-    const verticalStartY = shelfY + cornerRadius;
+    const verticalStartY = Math.min(shelfY + cornerRadius, endY);
     return [{
       ...edge,
       anchorX: startX,
       anchorY: parentCenterY,
+      branchX: startX,
+      branchY: startY,
       targetX: endX,
       targetY: endY,
       d: `M ${startX} ${startY} C ${startX + sideSign * horizontal * 0.34} ${startY + 2}, ${preCornerX} ${shelfY}, ${preCornerX} ${shelfY} C ${endX} ${shelfY}, ${endX} ${verticalStartY}, ${endX} ${verticalStartY} L ${endX} ${endY}`,
@@ -418,6 +562,8 @@ export default function TreeOverview({ rootTree, focusedNodeId, streamingNodeIds
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [dragging, setDragging] = useState(false);
+  const [hoveredNodeId, setHoveredNodeId] = useState<string | null>(null);
+  const [showFullText, setShowFullText] = useState(false);
 
   useEffect(() => {
     const viewport = viewportRef.current;
@@ -434,9 +580,33 @@ export default function TreeOverview({ rootTree, focusedNodeId, streamingNodeIds
   }, []);
 
   const layout = useMemo(
-    () => buildTreeOverviewLayout(rootTree, viewportWidth, focusedNodeId),
-    [focusedNodeId, rootTree, viewportWidth],
+    () => buildTreeOverviewLayout(rootTree, viewportWidth, focusedNodeId, showFullText),
+    [focusedNodeId, rootTree, showFullText, viewportWidth],
   );
+  const activePathNodeIds = useMemo(() => {
+    const targetId = hoveredNodeId || focusedNodeId;
+    const byId = new Map(layout.nodes.map(node => [node.id, node]));
+    const ids = new Set<string>();
+    let current = targetId ? byId.get(targetId) || null : null;
+    while (current) {
+      ids.add(current.id);
+      current = current.node.parent_id ? byId.get(current.node.parent_id) || null : null;
+    }
+    return ids;
+  }, [focusedNodeId, hoveredNodeId, layout.nodes]);
+  const activePathOverlays = useMemo(() => {
+    return layout.edges
+      .filter(edge => activePathNodeIds.has(edge.fromId) && activePathNodeIds.has(edge.toId))
+      .map(edge => {
+        const parentRail = edge.relation === 'followup' && Math.abs(edge.branchY - edge.anchorY) > 1
+          ? `M ${edge.anchorX} ${edge.anchorY} L ${edge.branchX} ${edge.branchY} `
+          : '';
+        return {
+          id: `active:${edge.id}`,
+          d: `${parentRail}${edge.d}`,
+        };
+      });
+  }, [activePathNodeIds, layout.edges]);
   const rootId = rootTree[0]?.id;
 
   const recenter = useCallback(() => {
@@ -607,7 +777,7 @@ export default function TreeOverview({ rootTree, focusedNodeId, streamingNodeIds
   return (
     <div
       ref={viewportRef}
-      className={`tree-overview${dragging ? ' is-dragging' : ''}`}
+      className={`tree-overview${dragging ? ' is-dragging' : ''}${hoveredNodeId ? ' has-hover-path' : ''}${showFullText ? ' is-full-text' : ''}`}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={endDrag}
@@ -615,6 +785,14 @@ export default function TreeOverview({ rootTree, focusedNodeId, streamingNodeIds
       onWheel={handleWheel}
     >
       <div className="tree-overview-controls">
+        <button
+          className={`tree-overview-control${showFullText ? ' is-active' : ''}`}
+          onClick={() => setShowFullText(current => !current)}
+          title={showFullText ? t('overviewShowTruncatedText') : t('overviewShowFullText')}
+          aria-pressed={showFullText}
+        >
+          <AlignLeft size={15} />
+        </button>
         <button className="tree-overview-control" onClick={() => scaleAtViewportCenter(1.12)} title={t('overviewZoomIn')}>
           <Plus size={15} />
         </button>
@@ -655,12 +833,23 @@ export default function TreeOverview({ rootTree, focusedNodeId, streamingNodeIds
             {layout.edges.map(edge => (
               <motion.path
                 key={edge.id}
-                className={`tree-overview-edge edge-${edge.relation}${edge.isInFocusPath ? ' is-focus-path' : ''}`}
+                className={`tree-overview-edge edge-${edge.relation}${edge.isInFocusPath ? ' is-focus-path' : ''}${activePathNodeIds.has(edge.fromId) && activePathNodeIds.has(edge.toId) ? ' is-active-path' : ''}`}
                 d={edge.d}
                 initial={{ pathLength: 0, opacity: 0 }}
                 animate={{ d: edge.d, pathLength: 1, opacity: 1 }}
                 exit={{ pathLength: 0, opacity: 0 }}
                 transition={{ type: 'spring', stiffness: 180, damping: 26, mass: 0.8 }}
+              />
+            ))}
+            {activePathOverlays.map(overlay => (
+              <motion.path
+                key={overlay.id}
+                className="tree-overview-active-overlay"
+                d={overlay.d}
+                initial={{ pathLength: 0, opacity: 0 }}
+                animate={{ d: overlay.d, pathLength: 1, opacity: 1 }}
+                exit={{ pathLength: 0, opacity: 0 }}
+                transition={{ type: 'spring', stiffness: 210, damping: 26, mass: 0.75 }}
               />
             ))}
           </AnimatePresence>
@@ -670,11 +859,12 @@ export default function TreeOverview({ rootTree, focusedNodeId, streamingNodeIds
           {layout.nodes.map(item => {
             const edge = layout.edges.find(candidate => candidate.toId === item.id);
             const isStreaming = streamingNodeIds.has(item.id);
+            const isActivePath = activePathNodeIds.has(item.id);
             return (
               <motion.button
                 key={item.id}
                 type="button"
-                className={`tree-overview-node node-${item.relation} side-${item.side === -1 ? 'left' : 'right'}${item.isFocused ? ' is-focused' : ''}${item.isInFocusPath ? ' is-focus-path' : ''}${isStreaming ? ' is-streaming' : ''}`}
+                className={`tree-overview-node node-${item.relation} side-${item.side === -1 ? 'left' : 'right'}${item.isFocused ? ' is-focused' : ''}${item.isInFocusPath ? ' is-focus-path' : ''}${isActivePath ? ' is-active-path' : ''}${isStreaming ? ' is-streaming' : ''}`}
                 title={item.quote ? `${item.quote}\n${item.node.content}` : item.node.content}
                 initial={{
                   x: edge
@@ -704,6 +894,10 @@ export default function TreeOverview({ rootTree, focusedNodeId, streamingNodeIds
                   event.stopPropagation();
                   onSelectNode(item.node);
                 }}
+                onMouseEnter={() => setHoveredNodeId(item.id)}
+                onMouseLeave={() => setHoveredNodeId(current => current === item.id ? null : current)}
+                onFocus={() => setHoveredNodeId(item.id)}
+                onBlur={() => setHoveredNodeId(current => current === item.id ? null : current)}
               >
                 <span className="tree-overview-dot" aria-hidden="true" />
                 <span className="tree-overview-label">
@@ -731,18 +925,18 @@ export default function TreeOverview({ rootTree, focusedNodeId, streamingNodeIds
 interface MiniMapProps {
   rootTree: Node[];
   focusedNodeId: string | null;
-  stackHighlightNodeId?: string | null;
+  ringNodeId?: string | null;
   streamingNodeIds: Set<string>;
   onSelectNode: (node: Node) => void;
 }
 
-export function TreeOverviewMiniMap({ rootTree, focusedNodeId, stackHighlightNodeId, streamingNodeIds, onSelectNode }: MiniMapProps) {
+export function TreeOverviewMiniMap({ rootTree, focusedNodeId, ringNodeId, streamingNodeIds, onSelectNode }: MiniMapProps) {
   const layout = useMemo(
     () => buildTreeOverviewLayout(rootTree, 360, focusedNodeId),
     [focusedNodeId, rootTree],
   );
-  const stackHighlightNode = stackHighlightNodeId
-    ? layout.nodes.find(node => node.id === stackHighlightNodeId)
+  const ringNode = ringNodeId
+    ? layout.nodes.find(node => node.id === ringNodeId)
     : null;
 
   if (layout.nodes.length === 0) return null;
@@ -769,12 +963,12 @@ export function TreeOverviewMiniMap({ rootTree, focusedNodeId, stackHighlightNod
           />
         ))}
         <AnimatePresence>
-          {stackHighlightNode && (
+          {ringNode && (
             <motion.circle
-              key={stackHighlightNode.id}
-              className="tree-overview-minimap-stack-ring"
-              cx={stackHighlightNode.cx}
-              cy={stackHighlightNode.y + stackHighlightNode.height * 0.5}
+              key={ringNode.id}
+              className="tree-overview-minimap-ring"
+              cx={ringNode.cx}
+              cy={ringNode.y + ringNode.height * 0.5}
               initial={{ r: 12, opacity: 0 }}
               animate={{ r: 29, opacity: 1 }}
               exit={{ r: 14, opacity: 0 }}
@@ -784,7 +978,7 @@ export function TreeOverviewMiniMap({ rootTree, focusedNodeId, stackHighlightNod
         </AnimatePresence>
         {layout.nodes.map(node => {
           const isStreaming = streamingNodeIds.has(node.id);
-          const isStackHighlight = node.id === stackHighlightNodeId;
+          const isRingHighlight = node.id === ringNodeId;
           return (
             <g
               key={node.id}
@@ -801,10 +995,10 @@ export function TreeOverviewMiniMap({ rootTree, focusedNodeId, stackHighlightNod
               }}
             >
               <circle
-                className={`tree-overview-minimap-dot${node.isFocused ? ' is-focused' : ''}${isStackHighlight ? ' is-stack-highlight' : ''}${isStreaming ? ' is-streaming' : ''}`}
+                className={`tree-overview-minimap-dot${node.isFocused ? ' is-focused' : ''}${isRingHighlight ? ' is-ring-highlight' : ''}${isStreaming ? ' is-streaming' : ''}`}
                 cx={node.cx}
                 cy={node.y + node.height * 0.5}
-                r={node.isFocused ? 23 : isStackHighlight ? 21 : 14}
+                r={node.isFocused ? 23 : 14}
               />
             </g>
           );

@@ -6,6 +6,7 @@ import ChatArea from './components/ChatArea';
 import InputBar from './components/InputBar';
 import type { CurrentUser } from './types';
 import { LANGUAGES, getLanguage, setLanguage, setLanguageFromLocale, useLanguage, useT, type Language } from './i18n';
+import { PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 
 // 懒加载 — ConfigModal 仅在点击齿轮时出现
 const ConfigModal = lazy(() => import('./components/ConfigModal'));
@@ -77,6 +78,8 @@ export default function App() {
   const focusNode = useAppStore(s => s.focusNode);
   const currentRootId = useAppStore(s => s.currentRootId);
   const streamingNodeIds = useAppStore(s => s.streamingNodeIds);
+  const focusReadingNodeId = useAppStore(s => s.focusReadingNodeId);
+  const focusReadingActive = Boolean(focusReadingNodeId);
   const [showConfig, setShowConfig] = React.useState(false);
   const [sidebarOpen, setSidebarOpen] = React.useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = React.useState(false);
@@ -92,6 +95,10 @@ export default function App() {
   const [authDisplayName, setAuthDisplayName] = React.useState('');
   const [authSubmitting, setAuthSubmitting] = React.useState(false);
   const [authError, setAuthError] = React.useState('');
+
+  useEffect(() => {
+    if (focusReadingActive) setSidebarOpen(false);
+  }, [focusReadingActive]);
 
   // ── 可调整侧边栏宽度 ──
   const [sidebarWidth, setSidebarWidth] = React.useState(loadSidebarWidth);
@@ -318,7 +325,7 @@ export default function App() {
 
   return (
     <div
-      className="app-layout"
+      className={`app-layout${focusReadingActive ? ' focus-reading-mode' : ''}`}
       style={{ '--sidebar-width': `${sidebarWidth}px` } as React.CSSProperties}
     >
       {/* Mobile overlay */}
@@ -328,7 +335,7 @@ export default function App() {
       />
 
       {/* Sidebar */}
-      <div className={`sidebar ${sidebarOpen ? 'open' : ''} ${sidebarCollapsed ? 'collapsed' : ''}`}>
+      <div className={`sidebar ${sidebarOpen ? 'open' : ''} ${sidebarCollapsed || focusReadingActive ? 'collapsed' : ''}`}>
         <Sidebar
           onConfigClick={() => setShowConfig(true)}
           onRootSelect={() => setSidebarOpen(false)}
@@ -342,8 +349,9 @@ export default function App() {
         className="sidebar-toggle-btn"
         onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
         title={sidebarCollapsed ? t('expandSidebar') : t('collapseSidebar')}
+        aria-label={sidebarCollapsed ? t('expandSidebar') : t('collapseSidebar')}
       >
-        {sidebarCollapsed ? '▶' : '◀'}
+        {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
       </button>
 
       {/* Main */}
@@ -367,6 +375,7 @@ export default function App() {
         ) : (
           <div className="empty-state">
             <h2>{t('homePrompt')}</h2>
+            <p>{t('homeSubtitle')}</p>
           </div>
         )}
         <InputBar />

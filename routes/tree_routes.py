@@ -32,6 +32,21 @@ router = APIRouter()
 @router.get("/api/roots")
 def list_roots(request: Request):
     user_id = _get_user_id(request)
+    if request.query_params.get("paged") == "1":
+        cursor = (request.query_params.get("cursor") or "").strip()
+        cursor_updated_at = None
+        cursor_id = None
+        if "|" in cursor:
+            cursor_updated_at, cursor_id = cursor.rsplit("|", 1)
+        limit = int(request.query_params.get("limit") or 120)
+        updated_after = (request.query_params.get("updated_after") or "").strip() or None
+        return JSONResponse(db.get_roots_page(
+            user_id=user_id,
+            limit=limit,
+            updated_after=updated_after,
+            cursor_updated_at=cursor_updated_at,
+            cursor_id=cursor_id,
+        ))
     return JSONResponse(db.get_all_roots(user_id=user_id))
 
 
@@ -45,7 +60,7 @@ def list_root_groups(request: Request):
 async def create_root_group(request: Request):
     user_id = _get_user_id(request)
     data = await request.json()
-    group = db.create_root_group(data.get("name", ""), user_id=user_id)
+    group = db.create_root_group(data.get("name", ""), user_id=user_id, parent_id=data.get("parent_id") or None)
     return JSONResponse(group)
 
 

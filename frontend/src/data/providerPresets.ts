@@ -2,7 +2,7 @@
  * MegaForm — 模型供应商预设
  * 提供快速接入能力：选择供应商后自动填充 URL、价格等，用户只需选模型+填 API Key
  *
- * 价格来源（2026-05 最新）：
+ * 价格来源（2026-07 最新）：
  * - DeepSeek: https://api-docs.deepseek.com/quick_start/pricing
  * - OpenAI: https://platform.openai.com/docs/pricing
  * - Anthropic: https://platform.claude.com/docs/en/about-claude/pricing
@@ -80,38 +80,11 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     api_key_hint: 'sk-...',
     currency: 'USD',
     models: [
-      { model_name: 'gpt-5.5', name: 'GPT-5.5', max_tokens: 16384, price_per_input: 0, price_per_output: 0, capabilities: { image_input: true } },
-      { model_name: 'gpt-5.2', name: 'GPT-5.2 (最新旗舰)', max_tokens: 16384, price_per_input: 0.00175, price_per_output: 0.014, capabilities: { image_input: true } },
-      { model_name: 'gpt-5', name: 'GPT-5', max_tokens: 16384, price_per_input: 0.00125, price_per_output: 0.01, capabilities: { image_input: true } },
-      { model_name: 'gpt-5-mini', name: 'GPT-5 Mini (性价比)', max_tokens: 16384, price_per_input: 0.00025, price_per_output: 0.002, capabilities: { image_input: true } },
-      { model_name: 'gpt-5-nano', name: 'GPT-5 Nano (最便宜)', max_tokens: 16384, price_per_input: 0.00005, price_per_output: 0.0004, capabilities: { image_input: true } },
-      { model_name: 'gpt-4.1', name: 'GPT-4.1 (1M 上下文)', max_tokens: 32768, price_per_input: 0.002, price_per_output: 0.008, capabilities: { image_input: true } },
-      { model_name: 'gpt-4.1-mini', name: 'GPT-4.1 Mini', max_tokens: 16384, price_per_input: 0.0004, price_per_output: 0.0016, capabilities: { image_input: true } },
-      { model_name: 'gpt-4o', name: 'GPT-4o', max_tokens: 16384, price_per_input: 0.0025, price_per_output: 0.01, capabilities: { image_input: true } },
-      { model_name: 'gpt-4o-mini', name: 'GPT-4o Mini', max_tokens: 16384, price_per_input: 0.00015, price_per_output: 0.0006, capabilities: { image_input: true } },
+      { model_name: 'gpt-5.5', name: 'GPT-5.5 (GPT 系列旗舰)', max_tokens: 16384, price_per_input: 0, price_per_output: 0, capabilities: { image_input: true } },
       {
-        model_name: 'o3', name: 'o3 (推理)',
+        model_name: 'o3-pro', name: 'o3 Pro (o 系列旗舰)',
         max_tokens: 16384, price_per_input: 0.002, price_per_output: 0.008,
         capabilities: { image_input: true },
-        thinking: [
-          { label: '低', budget: 1024, description: '~1K 推理 token' },
-          { label: '中', budget: 8192, description: '~8K 推理 token' },
-          { label: '高', budget: 32768, description: '~32K 推理 token' },
-        ],
-      },
-      {
-        model_name: 'o4-mini', name: 'o4 Mini (性价比推理)',
-        max_tokens: 16384, price_per_input: 0.0011, price_per_output: 0.0044,
-        capabilities: { image_input: true },
-        thinking: [
-          { label: '低', budget: 1024, description: '~1K 推理 token' },
-          { label: '中', budget: 8192, description: '~8K 推理 token' },
-          { label: '高', budget: 32768, description: '~32K 推理 token' },
-        ],
-      },
-      {
-        model_name: 'o3-mini', name: 'o3 Mini',
-        max_tokens: 16384, price_per_input: 0.0011, price_per_output: 0.0044,
         thinking: [
           { label: '低', budget: 1024, description: '~1K 推理 token' },
           { label: '中', budget: 8192, description: '~8K 推理 token' },
@@ -130,7 +103,13 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     currency: 'USD',
     models: [
       {
-        model_name: 'claude-opus-4-7-20250514', name: 'Claude Opus 4.7 (旗舰)',
+        model_name: 'claude-fable-5', name: 'Claude Fable 5 (最高能力)',
+        max_tokens: 16384, price_per_input: 0, price_per_output: 0,
+        capabilities: { image_input: true },
+        thinking: [{ label: '开', budget: 1, description: 'adaptive 思考' }],
+      },
+      {
+        model_name: 'claude-opus-4-8', name: 'Claude Opus 4.8 (Opus 系列旗舰)',
         max_tokens: 16384, price_per_input: 0.005, price_per_output: 0.025,
         capabilities: { image_input: true },
         thinking: [
@@ -138,18 +117,8 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
         ],
       },
       {
-        model_name: 'claude-sonnet-4-6-20250514', name: 'Claude Sonnet 4.6 (均衡)',
+        model_name: 'claude-sonnet-5', name: 'Claude Sonnet 5 (Sonnet 系列旗舰)',
         max_tokens: 16384, price_per_input: 0.003, price_per_output: 0.015,
-        capabilities: { image_input: true },
-        thinking: [
-          { label: '低', budget: 1024, description: '~1K 思考 token' },
-          { label: '中', budget: 8192, description: '~8K 思考 token' },
-          { label: '高', budget: 32768, description: '~32K 思考 token' },
-        ],
-      },
-      {
-        model_name: 'claude-haiku-4-5-20250514', name: 'Claude Haiku 4.5 (轻量)',
-        max_tokens: 16384, price_per_input: 0.001, price_per_output: 0.005,
         capabilities: { image_input: true },
         thinking: [
           { label: '低', budget: 1024, description: '~1K 思考 token' },
@@ -169,7 +138,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     currency: 'USD',
     models: [
       {
-        model_name: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (预览)',
+        model_name: 'gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro (Pro 系列旗舰)',
         max_tokens: 16384, price_per_input: 0.002, price_per_output: 0.012,
         capabilities: { image_input: true },
         thinking: [
@@ -180,23 +149,8 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
         ],
       },
       {
-        model_name: 'gemini-3.1-flash-lite-preview', name: 'Gemini 3.1 Flash-Lite (预览)',
-        max_tokens: 16384, price_per_input: 0.00025, price_per_output: 0.0015,
-        capabilities: { image_input: true },
-      },
-      {
-        model_name: 'gemini-2.5-pro', name: 'Gemini 2.5 Pro',
-        max_tokens: 16384, price_per_input: 0.00125, price_per_output: 0.01,
-        capabilities: { image_input: true },
-        thinking: [
-          { label: '低', budget: 1024, description: '~1K thinkingBudget (最小128)' },
-          { label: '中', budget: 8192, description: '~8K thinkingBudget' },
-          { label: '高', budget: 32768, description: '~32K thinkingBudget' },
-        ],
-      },
-      {
-        model_name: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash',
-        max_tokens: 16384, price_per_input: 0.0003, price_per_output: 0.0025,
+        model_name: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash (Flash 系列旗舰)',
+        max_tokens: 16384, price_per_input: 0, price_per_output: 0,
         capabilities: { image_input: true },
         thinking: [
           { label: '关', budget: 0, description: '不启用思考' },
@@ -204,11 +158,6 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
           { label: '中', budget: 8192, description: '~8K thinkingBudget' },
           { label: '高', budget: 32768, description: '~32K thinkingBudget' },
         ],
-      },
-      {
-        model_name: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash-Lite (高性价比)',
-        max_tokens: 16384, price_per_input: 0.0001, price_per_output: 0.0004,
-        capabilities: { image_input: true },
       },
     ],
   },
@@ -222,8 +171,9 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     currency: 'USD',
     models: [
       {
-        model_name: 'grok-4.1-fast', name: 'Grok 4.1 Fast (性价比推理)',
-        max_tokens: 16384, price_per_input: 0.0002, price_per_output: 0.0005,
+        model_name: 'grok-4.5', name: 'Grok 4.5 (通用旗舰)',
+        max_tokens: 16384, price_per_input: 0.00125, price_per_output: 0.0025,
+        capabilities: { image_input: true },
         thinking: [
           { label: '低', budget: 1024, description: '~1K 推理 token' },
           { label: '中', budget: 8192, description: '~8K 推理 token' },
@@ -231,17 +181,14 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
         ],
       },
       {
-        model_name: 'grok-4', name: 'Grok 4 (旗舰)',
-        max_tokens: 16384, price_per_input: 0.003, price_per_output: 0.015,
+        model_name: 'grok-4.20-multi-agent', name: 'Grok 4.20 Multi-Agent (研究旗舰)',
+        max_tokens: 16384, price_per_input: 0.00125, price_per_output: 0.0025,
+        capabilities: { image_input: true },
         thinking: [
           { label: '低', budget: 1024, description: '~1K 推理 token' },
           { label: '中', budget: 8192, description: '~8K 推理 token' },
           { label: '高', budget: 32768, description: '~32K 推理 token' },
         ],
-      },
-      {
-        model_name: 'grok-3-mini', name: 'Grok 3 Mini (轻量)',
-        max_tokens: 16384, price_per_input: 0.0003, price_per_output: 0.0005,
       },
     ],
   },
@@ -255,61 +202,55 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     currency: 'USD',
     models: [
       {
-        model_name: 'openai/gpt-5.2', name: 'OpenAI GPT-5.2',
-        max_tokens: 16384, price_per_input: 0.00175, price_per_output: 0.014,
+        model_name: 'openai/gpt-5.5', name: 'OpenAI GPT-5.5',
+        max_tokens: 16384, price_per_input: 0, price_per_output: 0,
         capabilities: { image_input: true },
       },
       {
-        model_name: 'openai/gpt-5', name: 'OpenAI GPT-5',
-        max_tokens: 16384, price_per_input: 0.00125, price_per_output: 0.01,
+        model_name: 'anthropic/claude-fable-5', name: 'Claude Fable 5',
+        max_tokens: 16384, price_per_input: 0, price_per_output: 0,
         capabilities: { image_input: true },
       },
       {
-        model_name: 'openai/gpt-5-mini', name: 'OpenAI GPT-5 Mini',
-        max_tokens: 16384, price_per_input: 0.00025, price_per_output: 0.002,
+        model_name: 'anthropic/claude-opus-4.8', name: 'Claude Opus 4.8',
+        max_tokens: 16384, price_per_input: 0.005, price_per_output: 0.025,
         capabilities: { image_input: true },
       },
       {
-        model_name: 'anthropic/claude-sonnet-4-6', name: 'Claude Sonnet 4.6',
-        max_tokens: 16384, price_per_input: 0.003, price_per_output: 0.015,
+        model_name: 'google/gemini-3.1-pro-preview', name: 'Gemini 3.1 Pro',
+        max_tokens: 16384, price_per_input: 0.002, price_per_output: 0.012,
         capabilities: { image_input: true },
       },
       {
-        model_name: 'anthropic/claude-haiku-4-5', name: 'Claude Haiku 4.5',
-        max_tokens: 16384, price_per_input: 0.001, price_per_output: 0.005,
+        model_name: 'google/gemini-3.5-flash', name: 'Gemini 3.5 Flash',
+        max_tokens: 16384, price_per_input: 0, price_per_output: 0,
         capabilities: { image_input: true },
       },
       {
-        model_name: 'google/gemini-2.5-pro', name: 'Gemini 2.5 Pro',
-        max_tokens: 16384, price_per_input: 0.00125, price_per_output: 0.01,
+        model_name: 'x-ai/grok-4.5', name: 'Grok 4.5',
+        max_tokens: 16384, price_per_input: 0.00125, price_per_output: 0.0025,
         capabilities: { image_input: true },
-      },
-      {
-        model_name: 'google/gemini-2.5-flash', name: 'Gemini 2.5 Flash',
-        max_tokens: 16384, price_per_input: 0.0003, price_per_output: 0.0025,
-        capabilities: { image_input: true },
-      },
-      {
-        model_name: 'deepseek/deepseek-v4-flash', name: 'DeepSeek V4 Flash',
-        max_tokens: 16384, price_per_input: 0.00014, price_per_output: 0.00028,
       },
       {
         model_name: 'deepseek/deepseek-v4-pro', name: 'DeepSeek V4 Pro',
         max_tokens: 16384, price_per_input: 0.000435, price_per_output: 0.00087,
       },
       {
-        model_name: 'x-ai/grok-4.1-fast', name: 'Grok 4.1 Fast',
-        max_tokens: 16384, price_per_input: 0.0002, price_per_output: 0.0005,
-        thinking: [
-          { label: '低', budget: 1024, description: '~1K 推理 token' },
-          { label: '中', budget: 8192, description: '~8K 推理 token' },
-          { label: '高', budget: 32768, description: '~32K 推理 token' },
-        ],
+        model_name: 'z-ai/glm-5.1', name: 'GLM-5.1',
+        max_tokens: 32768, price_per_input: 0.00083, price_per_output: 0.00331,
       },
       {
-        model_name: 'google/gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash-Lite',
-        max_tokens: 16384, price_per_input: 0.0001, price_per_output: 0.0004,
+        model_name: 'minimax/minimax-m2.7', name: 'MiniMax M2.7',
+        max_tokens: 16384, price_per_input: 0.0003, price_per_output: 0.0012,
+      },
+      {
+        model_name: 'moonshotai/kimi-k2.5', name: 'Kimi K2.5',
+        max_tokens: 16384, price_per_input: 0, price_per_output: 0,
         capabilities: { image_input: true },
+      },
+      {
+        model_name: 'qwen/qwen3.7-max', name: 'Qwen3.7 Max',
+        max_tokens: 16384, price_per_input: 0, price_per_output: 0,
       },
     ],
   },
@@ -325,16 +266,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     currency: 'CNY',
     models: [
       {
-        model_name: 'deepseek-v4-flash', name: 'DeepSeek V4 Flash',
-        max_tokens: 16384, price_per_input: 0.001015, price_per_output: 0.00203,
-        thinking: [
-          { label: '关', budget: 0, description: '非思考模式' },
-          { label: '高', budget: 20000, description: 'reasoning_effort=high' },
-          { label: '极致', budget: 60000, description: 'reasoning_effort=max' },
-        ],
-      },
-      {
-        model_name: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro',
+        model_name: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro (旗舰)',
         max_tokens: 16384, price_per_input: 0.00315, price_per_output: 0.00631,
         thinking: [
           { label: '高', budget: 20000, description: 'reasoning_effort=high' },
@@ -353,7 +285,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     currency: 'CNY',
     models: [
       {
-        model_name: 'glm-5.1', name: 'GLM-5.1',
+        model_name: 'glm-5.1', name: 'GLM-5.1 (文本旗舰)',
         max_tokens: 32768, price_per_input: 0.006, price_per_output: 0.024,
         thinking: [
           { label: '低', budget: 1024, description: '~1K 思考 token' },
@@ -361,18 +293,10 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
           { label: '高', budget: 32768, description: '~32K 思考 token' },
         ],
       },
-      { model_name: 'glm-5-turbo', name: 'GLM-5 Turbo', max_tokens: 16384, price_per_input: 0.005, price_per_output: 0.022 },
-      { model_name: 'glm-4.7', name: 'GLM-4.7', max_tokens: 16384, price_per_input: 0.002, price_per_output: 0.008 },
-      { model_name: 'glm-4.7-flashx', name: 'GLM-4.7 FlashX', max_tokens: 16384, price_per_input: 0.0005, price_per_output: 0.003 },
-      { model_name: 'glm-4.7-flash', name: 'GLM-4.7 Flash (免费)', max_tokens: 16384, price_per_input: 0, price_per_output: 0 },
       {
-        model_name: 'glm-z1-flashx', name: 'GLM-Z1 FlashX (推理)',
-        max_tokens: 16384, price_per_input: 0.0001, price_per_output: 0.0001,
-        thinking: [
-          { label: '低', budget: 1024, description: '~1K 推理 token' },
-          { label: '中', budget: 8192, description: '~8K 推理 token' },
-          { label: '高', budget: 32768, description: '~32K 推理 token' },
-        ],
+        model_name: 'glm-5v-turbo', name: 'GLM-5V Turbo (多模态旗舰)',
+        max_tokens: 32768, price_per_input: 0, price_per_output: 0,
+        capabilities: { image_input: true },
       },
     ],
   },
@@ -386,12 +310,8 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     currency: 'CNY',
     models: [
       {
-        model_name: 'MiniMax-M2.7', name: 'MiniMax M2.7',
+        model_name: 'MiniMax-M2.7', name: 'MiniMax M2.7 (旗舰)',
         max_tokens: 16384, price_per_input: 0.00218, price_per_output: 0.0087,
-      },
-      {
-        model_name: 'MiniMax-M1', name: 'MiniMax M1 (推理)',
-        max_tokens: 16384, price_per_input: 0.0029, price_per_output: 0.01595,
         thinking: [
           { label: '低', budget: 1024, description: '~1K 推理 token' },
           { label: '中', budget: 8192, description: '~8K 推理 token' },
@@ -409,9 +329,16 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     api_key_hint: 'sk-...',
     currency: 'CNY',
     models: [
-      { model_name: 'moonshot-v1-8k', name: 'Moonshot V1 8K', max_tokens: 8192, price_per_input: 0.002, price_per_output: 0.01 },
-      { model_name: 'moonshot-v1-32k', name: 'Moonshot V1 32K', max_tokens: 32768, price_per_input: 0.005, price_per_output: 0.02 },
-      { model_name: 'moonshot-v1-128k', name: 'Moonshot V1 128K', max_tokens: 131072, price_per_input: 0.01, price_per_output: 0.03 },
+      {
+        model_name: 'kimi-k2.5', name: 'Kimi K2.5 (旗舰)',
+        max_tokens: 16384, price_per_input: 0, price_per_output: 0,
+        capabilities: { image_input: true },
+        thinking: [
+          { label: '低', budget: 1024, description: '~1K 思考 token' },
+          { label: '中', budget: 8192, description: '~8K 思考 token' },
+          { label: '高', budget: 32768, description: '~32K 思考 token' },
+        ],
+      },
     ],
   },
   {
@@ -423,8 +350,8 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     api_key_hint: '(本地无需 Key)',
     currency: 'CNY',
     models: [
-      { model_name: 'qwen3:8b', name: 'Qwen3 8B', max_tokens: 8192, price_per_input: 0, price_per_output: 0 },
-      { model_name: 'llama3:8b', name: 'Llama3 8B', max_tokens: 8192, price_per_input: 0, price_per_output: 0 },
+      { model_name: 'qwen3:235b', name: 'Qwen3 235B (Qwen 系列旗舰)', max_tokens: 16384, price_per_input: 0, price_per_output: 0 },
+      { model_name: 'llama4:maverick', name: 'Llama 4 Maverick (Llama 系列旗舰)', max_tokens: 16384, price_per_input: 0, price_per_output: 0 },
     ],
   },
   {
@@ -437,8 +364,8 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
     currency: 'CNY',
     models: [
       {
-        model_name: 'qwen3-max', name: 'Qwen3 Max (旗舰)',
-        max_tokens: 16384, price_per_input: 0.04, price_per_output: 0.12,
+        model_name: 'qwen3.7-max', name: 'Qwen3.7 Max (Max 系列旗舰)',
+        max_tokens: 16384, price_per_input: 0.012, price_per_output: 0.036,
         thinking: [
           { label: '低', budget: 1024, description: '~1K 思考 token' },
           { label: '中', budget: 8192, description: '~8K 思考 token' },
@@ -446,26 +373,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
         ],
       },
       {
-        model_name: 'qwen3-plus', name: 'Qwen3 Plus (均衡)',
-        max_tokens: 16384, price_per_input: 0.008, price_per_output: 0.02,
-        thinking: [
-          { label: '低', budget: 1024, description: '~1K 思考 token' },
-          { label: '中', budget: 8192, description: '~8K 思考 token' },
-          { label: '高', budget: 32768, description: '~32K 思考 token' },
-        ],
-      },
-      {
-        model_name: 'qwen3-turbo', name: 'Qwen3 Turbo (轻量)',
-        max_tokens: 16384, price_per_input: 0.003, price_per_output: 0.012,
-        thinking: [
-          { label: '低', budget: 1024, description: '~1K 思考 token' },
-          { label: '中', budget: 8192, description: '~8K 思考 token' },
-          { label: '高', budget: 32768, description: '~32K 思考 token' },
-        ],
-      },
-      { model_name: 'qwen3-flash', name: 'Qwen3 Flash (免费)', max_tokens: 8192, price_per_input: 0, price_per_output: 0 },
-      {
-        model_name: 'qwen3-coder-plus', name: 'Qwen3 Coder Plus',
+        model_name: 'qwen3-coder-plus', name: 'Qwen3 Coder Plus (Coder 系列旗舰)',
         max_tokens: 16384, price_per_input: 0.01, price_per_output: 0.04,
         thinking: [
           { label: '低', budget: 1024, description: '~1K 思考 token' },
@@ -474,7 +382,7 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
         ],
       },
       {
-        model_name: 'qwen3-omni-flash', name: 'Qwen3 Omni Flash (多模态)',
+        model_name: 'qwen3-omni-flash', name: 'Qwen3 Omni Flash (Omni 系列旗舰)',
         max_tokens: 8192, price_per_input: 0.0015, price_per_output: 0.006,
         capabilities: { image_input: true },
       },

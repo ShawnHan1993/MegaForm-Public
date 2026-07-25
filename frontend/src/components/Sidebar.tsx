@@ -8,10 +8,10 @@
  * - 新问题树按钮（重置当前问题树 + 聚焦输入框）
  * - 问题操作：切换、删除、编辑摘要
  */
-import { useState, useRef, useEffect, useMemo } from 'react';
+import { useState, useRef, useEffect, useMemo, type CSSProperties } from 'react';
 import { useAppStore } from '../store/appStore';
 import { api } from '../api/client';
-import type { Node, Root } from '../types';
+import type { Node, Root, RootGroup } from '../types';
 import {
   ChevronDown,
   ChevronRight,
@@ -25,34 +25,44 @@ import {
   Settings,
   X,
 } from 'lucide-react';
-import { getLanguage, tr, useT } from '../i18n';
+import { getLanguage, useT } from '../i18n';
 import ReferencePreview from './ReferencePreview';
 
 // ── 时间格式化 ──
-
-/** ISO 时间戳 → 相对时间（如 "3小时前"、"2天前"、"刚刚"） */
-function formatRelative(iso: string): string {
-  const language = getLanguage();
-  const now = Date.now();
-  const then = new Date(iso + (iso.endsWith('Z') ? '' : 'Z')).getTime();
-  const diff = now - then;
-  const sec = Math.floor(diff / 1000);
-  if (sec < 60) return tr('justNow', undefined, language);
-  const min = Math.floor(diff / 60 / 1000);
-  if (min < 60) return tr('minutesAgo', { count: min }, language);
-  const hr = Math.floor(min / 60);
-  if (hr < 24) return tr('hoursAgo', { count: hr }, language);
-  const day = Math.floor(hr / 24);
-  if (day < 30) return tr('daysAgo', { count: day }, language);
-  const mon = Math.floor(day / 30);
-  return tr('monthsAgo', { count: mon }, language);
-}
 
 /** ISO 时间戳 → 绝对日期（如 "2026-05-04 16:30"） */
 function formatAbsolute(iso: string): string {
   const d = new Date(iso + (iso.endsWith('Z') ? '' : 'Z'));
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function getRootTimeBucket(iso: string, labels: { today: string; yesterday: string; recent: string; month: string }) {
+  const date = new Date(iso + (iso.endsWith('Z') ? '' : 'Z'));
+  const today = new Date();
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const startOfDate = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+  const yesterday = new Date(startOfToday);
+  yesterday.setDate(yesterday.getDate() - 1);
+
+  if (startOfDate.getTime() === startOfToday.getTime()) {
+    return { key: 'today', label: labels.today };
+  }
+  if (startOfDate.getTime() === yesterday.getTime()) {
+    return { key: 'yesterday', label: labels.yesterday };
+  }
+
+  const calendarDays = Math.round((startOfToday.getTime() - startOfDate.getTime()) / 86_400_000);
+  if (calendarDays > 1 && calendarDays < 7) {
+    return { key: 'recent', label: labels.recent };
+  }
+  if (date.getFullYear() === today.getFullYear() && date.getMonth() === today.getMonth()) {
+    return { key: 'month', label: labels.month };
+  }
+
+  const key = `${date.getFullYear()}-${date.getMonth() + 1}`;
+  const label = new Intl.DateTimeFormat(getLanguage(), { year: 'numeric', month: 'long' }).format(date);
+  return { key, label };
 }
 
 interface Props {
@@ -71,6 +81,12 @@ interface SearchResult {
 
 const DEFAULT_GROUP_ID = '__default__';
 const LS_RECENT_GROUP_COLLAPSED = 'megaform-recent-group-collapsed';
+const DRAG_SCROLL_EDGE_SIZE = 48;
+const DRAG_SCROLL_MAX_SPEED = 14;
+
+function persistInBackground(task: Promise<unknown>, label: string) {
+  void task.catch(err => console.error(`[sidebar] ${label} failed:`, err));
+}
 
 export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
   const t = useT();
@@ -89,6 +105,9 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
   const moveRootToGroup = useAppStore(s => s.moveRootToGroup);
   const triggerInputFocus = useAppStore(s => s.triggerInputFocus);
   const resetRoot = useAppStore(s => s.resetRoot);
+  const loadMoreRoots = useAppStore(s => s.loadMoreRoots);
+  const rootsHasMore = useAppStore(s => s.rootsHasMore);
+  const rootsLoadingMore = useAppStore(s => s.rootsLoadingMore);
   const maxRootNodeCount = useMemo(
     () => Math.max(1, ...roots.map(root => root.node_count ?? 0)),
     [roots],
@@ -98,8 +117,10 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
   const [showSearch, setShowSearch] = useState(false);
   const [selectedSearchGroupIds, setSelectedSearchGroupIds] = useState<string[]>([]);
   const [dragRootId, setDragRootId] = useState<string | null>(null);
+  const [dragGroupId, setDragGroupId] = useState<string | null>(null);
   const [dragOverGroupId, setDragOverGroupId] = useState<string | null>(null);
   const [moveMenuRootId, setMoveMenuRootId] = useState<string | null>(null);
+  const [pendingRootId, setPendingRootId] = useState<string | null>(null);
   const [defaultGroupCollapsed, setDefaultGroupCollapsed] = useState(false);
   const [recentGroupCollapsed, setRecentGroupCollapsed] = useState(
     () => localStorage.getItem(LS_RECENT_GROUP_COLLAPSED) === '1',
@@ -111,6 +132,9 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
   const [editingSummaryText, setEditingSummaryText] = useState('');
   const editInputRef = useRef<HTMLInputElement>(null);
   const dragImageRef = useRef<HTMLElement | null>(null);
+  const sidebarGroupsRef = useRef<HTMLDivElement | null>(null);
+  const dragScrollFrameRef = useRef<number | null>(null);
+  const dragScrollVelocityRef = useRef(0);
   const previousRecentNodesRef = useRef<Node[]>([]);
 
   const rootsByGroup = useMemo(() => {
@@ -123,6 +147,28 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
     }
     return map;
   }, [roots, rootGroups]);
+
+  type GroupTreeNode = RootGroup & { children: GroupTreeNode[] };
+
+  const groupTree = useMemo(() => {
+    const nodes = new Map<string, GroupTreeNode>();
+    const roots: GroupTreeNode[] = [];
+    for (const group of rootGroups) {
+      nodes.set(group.id, { ...group, children: [] });
+    }
+    for (const group of rootGroups) {
+      const node = nodes.get(group.id)!;
+      const parent = group.parent_id ? nodes.get(group.parent_id) : null;
+      if (parent && parent.id !== node.id) parent.children.push(node);
+      else roots.push(node);
+    }
+    const sortGroups = (list: GroupTreeNode[]) => {
+      list.sort((a, b) => (a.sort_order - b.sort_order) || a.created_at.localeCompare(b.created_at));
+      list.forEach(group => sortGroups(group.children));
+    };
+    sortGroups(roots);
+    return roots;
+  }, [rootGroups]);
 
   const searchGroups = useMemo(
     () => [
@@ -155,6 +201,25 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
     }
     previousRecentNodesRef.current = recentNodes;
   }, [recentNodes]);
+
+  useEffect(() => () => stopDragAutoScroll(), []);
+
+  const maybeLoadMoreRoots = () => {
+    const container = sidebarGroupsRef.current;
+    if (!container || !rootsHasMore || rootsLoadingMore) return;
+    const remaining = container.scrollHeight - container.scrollTop - container.clientHeight;
+    if (remaining < 160) {
+      loadMoreRoots().catch(err => console.error('[roots] load more failed:', err));
+    }
+  };
+
+  useEffect(() => {
+    const container = sidebarGroupsRef.current;
+    if (!container || !rootsHasMore || rootsLoadingMore) return;
+    if (container.scrollHeight <= container.clientHeight + 8) {
+      loadMoreRoots().catch(err => console.error('[roots] load more failed:', err));
+    }
+  }, [roots.length, rootsHasMore, rootsLoadingMore, loadMoreRoots]);
 
   /** 保存摘要 */
   const saveSummary = async (rootId: string) => {
@@ -230,39 +295,126 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
   };
 
   /** 删除问题树（带确认） */
-  const handleDeleteRoot = async (e: React.MouseEvent, rootId: string) => {
+  const handleDeleteRoot = (e: React.MouseEvent, rootId: string) => {
     e.stopPropagation();
     if (confirm(t('deleteRootConfirm'))) {
-      await deleteRoot(rootId);
+      persistInBackground(deleteRoot(rootId), 'delete root');
     }
   };
 
-  const handleCreateGroup = async () => {
+  const handleCreateGroup = async (parentId?: string | null) => {
     const name = prompt(t('newGroupName'), '');
     if (!name?.trim()) return;
-    await createRootGroup(name.trim());
+    await createRootGroup(name.trim(), parentId || null);
+    if (parentId) {
+      const parent = rootGroups.find(group => group.id === parentId);
+      if (parent?.collapsed) {
+        persistInBackground(
+          updateRootGroup(parentId, { collapsed: 0 } as Partial<RootGroup>),
+          'expand parent group',
+        );
+      }
+    }
   };
 
-  const handleRenameGroup = async (groupId: string, currentName: string) => {
+  const handleRenameGroup = (groupId: string, currentName: string) => {
     const name = prompt(t('renameGroup'), currentName);
     if (!name?.trim()) return;
-    await updateRootGroup(groupId, { name: name.trim() } as any);
+    persistInBackground(updateRootGroup(groupId, { name: name.trim() }), 'rename group');
   };
 
-  const handleDeleteGroup = async (groupId: string) => {
+  const handleDeleteGroup = (groupId: string) => {
     if (!confirm(t('deleteGroupConfirm'))) return;
-    await deleteRootGroup(groupId);
+    persistInBackground(deleteRootGroup(groupId), 'delete group');
   };
 
   const getGroupDragKey = (groupId: string | null) => groupId || DEFAULT_GROUP_ID;
 
+  const isGroupDescendant = (groupId: string, possibleDescendantId: string | null) => {
+    if (!possibleDescendantId) return false;
+    let current = rootGroups.find(group => group.id === possibleDescendantId) || null;
+    while (current?.parent_id) {
+      if (current.parent_id === groupId) return true;
+      current = rootGroups.find(group => group.id === current?.parent_id) || null;
+    }
+    return false;
+  };
+
+  const stopDragAutoScroll = () => {
+    dragScrollVelocityRef.current = 0;
+    if (dragScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(dragScrollFrameRef.current);
+      dragScrollFrameRef.current = null;
+    }
+  };
+
+  const tickDragAutoScroll = () => {
+    const container = sidebarGroupsRef.current;
+    const velocity = dragScrollVelocityRef.current;
+    if (!container || velocity === 0) {
+      dragScrollFrameRef.current = null;
+      return;
+    }
+    container.scrollTop += velocity;
+    dragScrollFrameRef.current = window.requestAnimationFrame(tickDragAutoScroll);
+  };
+
+  const updateDragAutoScroll = (e: React.DragEvent) => {
+    const container = sidebarGroupsRef.current;
+    const dragKind = e.dataTransfer.getData('application/x-megaform-drag-kind');
+    if (!container || (!dragRootId && !dragGroupId && !dragKind)) {
+      stopDragAutoScroll();
+      return;
+    }
+    const rect = container.getBoundingClientRect();
+    let velocity = 0;
+    if (e.clientY < rect.top + DRAG_SCROLL_EDGE_SIZE) {
+      const distance = rect.top + DRAG_SCROLL_EDGE_SIZE - e.clientY;
+      velocity = -Math.max(3, Math.min(DRAG_SCROLL_MAX_SPEED, distance / 3));
+    } else if (e.clientY > rect.bottom - DRAG_SCROLL_EDGE_SIZE) {
+      const distance = e.clientY - (rect.bottom - DRAG_SCROLL_EDGE_SIZE);
+      velocity = Math.max(3, Math.min(DRAG_SCROLL_MAX_SPEED, distance / 3));
+    }
+
+    dragScrollVelocityRef.current = velocity;
+    if (velocity !== 0 && dragScrollFrameRef.current === null) {
+      dragScrollFrameRef.current = window.requestAnimationFrame(tickDragAutoScroll);
+    } else if (velocity === 0 && dragScrollFrameRef.current !== null) {
+      stopDragAutoScroll();
+    }
+  };
+
   const handleRootDragStart = (e: React.DragEvent<HTMLDivElement>, root: Root) => {
+    e.stopPropagation();
     dragImageRef.current?.remove();
     setDragRootId(root.id);
+    setDragGroupId(null);
     setDragOverGroupId(getGroupDragKey(root.group_id || null));
     setMoveMenuRootId(null);
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', root.id);
+    e.dataTransfer.setData('application/x-megaform-drag-kind', 'root');
+
+    const source = e.currentTarget;
+    const clone = source.cloneNode(true) as HTMLElement;
+    clone.classList.add('root-drag-image');
+    clone.classList.remove('dragging');
+    clone.style.width = `${source.offsetWidth}px`;
+    document.body.appendChild(clone);
+    dragImageRef.current = clone;
+    e.dataTransfer.setDragImage(clone, 18, Math.max(18, source.offsetHeight / 2));
+  };
+
+  const handleGroupDragStart = (e: React.DragEvent<HTMLDivElement>, group: RootGroup) => {
+    e.stopPropagation();
+    dragImageRef.current?.remove();
+    setDragGroupId(group.id);
+    setDragRootId(null);
+    setDragOverGroupId(getGroupDragKey(group.parent_id || null));
+    setMoveMenuRootId(null);
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', group.id);
+    e.dataTransfer.setData('application/x-megaform-drag-kind', 'group');
 
     const source = e.currentTarget;
     const clone = source.cloneNode(true) as HTMLElement;
@@ -276,31 +428,74 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
 
   const handleGroupDragOver = (e: React.DragEvent, groupId: string | null) => {
     e.preventDefault();
+    e.stopPropagation();
+    const dragKind = e.dataTransfer.getData('application/x-megaform-drag-kind');
+    const transferredId = e.dataTransfer.getData('text/plain');
+    const draggedGroupId = dragKind === 'group' ? transferredId : dragGroupId;
+    const invalidGroupDrop = !!draggedGroupId
+      && (draggedGroupId === groupId || isGroupDescendant(draggedGroupId, groupId));
+    e.dataTransfer.dropEffect = invalidGroupDrop ? 'none' : 'move';
+    setDragOverGroupId(invalidGroupDrop ? null : getGroupDragKey(groupId));
+    updateDragAutoScroll(e);
+  };
+
+  const handleGroupsDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+    const dragKind = e.dataTransfer.getData('application/x-megaform-drag-kind');
+    if (!dragRootId && !dragGroupId && !dragKind) return;
+    e.preventDefault();
     e.dataTransfer.dropEffect = 'move';
-    setDragOverGroupId(getGroupDragKey(groupId));
+    updateDragAutoScroll(e);
+  };
+
+  const handleGroupsDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+    const nextTarget = e.relatedTarget as globalThis.Node | null;
+    if (!nextTarget || !e.currentTarget.contains(nextTarget)) {
+      stopDragAutoScroll();
+    }
   };
 
   const clearDragState = () => {
     dragImageRef.current?.remove();
     dragImageRef.current = null;
+    stopDragAutoScroll();
     setDragRootId(null);
+    setDragGroupId(null);
     setDragOverGroupId(null);
   };
 
-  const handleDropRoot = async (
+  const handleDropOnGroup = (
     e: React.DragEvent,
     groupId: string | null,
   ) => {
     e.preventDefault();
     e.stopPropagation();
-    if (!dragRootId) {
+    const dragKind = e.dataTransfer.getData('application/x-megaform-drag-kind');
+    const transferredId = e.dataTransfer.getData('text/plain');
+    const droppedRootId = dragKind === 'root' ? transferredId : dragRootId;
+    const droppedGroupId = dragKind === 'group' ? transferredId : dragGroupId;
+    if (!droppedRootId && !droppedGroupId) {
       clearDragState();
       return;
     }
-    try {
-      await moveRootToGroup(dragRootId, groupId);
-    } finally {
-      clearDragState();
+    clearDragState();
+    if (droppedRootId) {
+      persistInBackground(moveRootToGroup(droppedRootId, groupId), 'move root');
+    } else if (droppedGroupId) {
+      if (droppedGroupId !== groupId && !isGroupDescendant(droppedGroupId, groupId)) {
+        persistInBackground(
+          updateRootGroup(droppedGroupId, { parent_id: groupId } as Partial<RootGroup>),
+          'move group',
+        );
+        if (groupId) {
+          const target = rootGroups.find(group => group.id === groupId);
+          if (target?.collapsed) {
+            persistInBackground(
+              updateRootGroup(groupId, { collapsed: 0 } as Partial<RootGroup>),
+              'expand drop target',
+            );
+          }
+        }
+      }
     }
   };
 
@@ -315,18 +510,18 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
     return chars.length > maxLen ? `${chars.slice(0, maxLen).join('')}...` : chars.join('');
   };
 
-  const moveRootFromMenu = async (rootId: string, groupId: string | null) => {
-    await moveRootToGroup(rootId, groupId);
+  const moveRootFromMenu = (rootId: string, groupId: string | null) => {
     setMoveMenuRootId(null);
+    persistInBackground(moveRootToGroup(rootId, groupId), 'move root');
   };
 
   const handleRecentNodeSelect = async (node: Node) => {
+    window.history.pushState(null, '', '/node/' + node.id);
+    onRootSelect();
     if (node.root_id && currentRootId !== node.root_id) {
       await openRoot(node.root_id, { markRecent: false });
     }
     focusNode(node.id);
-    window.history.pushState(null, '', '/node/' + node.id);
-    onRootSelect();
   };
 
   const renderRecentNodeItem = (node: Node, exiting = false) => {
@@ -335,7 +530,7 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
     return (
       <button
         key={`${exiting ? 'exit' : 'recent'}-${node.id}`}
-        className={`recent-node-item${exiting ? ' exiting' : ''}`}
+        className={`recent-node-item${node.root_id === currentRootId ? ' active' : ''}${exiting ? ' exiting' : ''}`}
         onClick={() => !exiting && handleRecentNodeSelect(node)}
         disabled={exiting}
         title={node.content}
@@ -381,9 +576,11 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
           <span>{t('recentVisited')}</span>
         </div>
         <div className={`sidebar-group-body ${recentGroupCollapsed ? 'collapsed' : 'expanded'}`}>
-          <div className="root-list recent-node-list">
-            {recentNodes.map(node => renderRecentNodeItem(node, false))}
-            {displayExiting.map(node => renderRecentNodeItem(node, true))}
+          <div className="sidebar-group-body-inner">
+            <div className="root-list recent-node-list">
+              {recentNodes.map(node => renderRecentNodeItem(node, false))}
+              {displayExiting.map(node => renderRecentNodeItem(node, true))}
+            </div>
           </div>
         </div>
       </div>
@@ -403,10 +600,8 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
       <button onClick={async () => {
         const name = prompt(t('newGroupName'), '');
         if (!name?.trim()) return;
-        await createRootGroup(name.trim());
-        const groups = useAppStore.getState().rootGroups;
-        const created = groups[groups.length - 1];
-        if (created) await moveRootFromMenu(root.id, created.id);
+        const created = await createRootGroup(name.trim());
+        await moveRootFromMenu(root.id, created.id);
       }}>
         {t('newGroup')}
       </button>
@@ -416,13 +611,20 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
   const renderRootItem = (root: Root) => (
     <div
       key={root.id}
-      className={`root-item root-volume-${getRootVolumeLevel(root.node_count)} ${root.id === currentRootId ? 'active' : ''} ${dragRootId === root.id ? 'dragging' : ''}`}
+      className={`root-item root-volume-${getRootVolumeLevel(root.node_count)} ${root.id === (pendingRootId || currentRootId) ? 'active' : ''} ${dragRootId === root.id ? 'dragging' : ''}`}
       draggable
       onDragStart={e => handleRootDragStart(e, root)}
       onDragEnd={clearDragState}
       onDragOver={e => handleGroupDragOver(e, root.group_id || null)}
-      onDrop={e => handleDropRoot(e, root.group_id || null)}
-      onClick={() => { openRoot(root.id); window.history.pushState(null, '', '/root/' + root.id); onRootSelect(); }}
+      onDrop={e => handleDropOnGroup(e, root.group_id || null)}
+      onClick={() => {
+        setPendingRootId(root.id);
+        window.history.pushState(null, '', '/root/' + root.id);
+        onRootSelect();
+        void openRoot(root.id).finally(() => {
+          setPendingRootId(current => current === root.id ? null : current);
+        });
+      }}
     >
       <div className="root-item-main">
         {/* 有摘要则用摘要替代根问题，否则显示根问题 */}
@@ -441,13 +643,13 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
             placeholder={t('summaryPlaceholder')}
           />
         ) : (
-          <span className="root-title" title={root.content}>
+          <span
+            className="root-title"
+            title={`${root.content}\n${t('updatedAt', { time: formatAbsolute(root.updated_at) })}`}
+          >
             {root.summary || root.content}
           </span>
         )}
-        <span className="root-time" title={formatAbsolute(root.updated_at)}>
-          {formatRelative(root.updated_at)}
-        </span>
       </div>
       <div className="root-actions">
         <button
@@ -483,26 +685,62 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
     </div>
   );
 
+  const renderRootListItems = (items: Root[]) => {
+    const labels = {
+      today: t('sidebarTimeToday'),
+      yesterday: t('sidebarTimeYesterday'),
+      recent: t('sidebarTimeRecent'),
+      month: t('sidebarTimeThisMonth'),
+    };
+    const clusters: Array<{ key: string; label: string; roots: Root[] }> = [];
+    for (const root of items) {
+      const bucket = getRootTimeBucket(root.updated_at, labels);
+      const current = clusters[clusters.length - 1];
+      if (current?.key === bucket.key) current.roots.push(root);
+      else clusters.push({ ...bucket, roots: [root] });
+    }
+    return clusters.map((cluster, index) => (
+      <div className="root-time-cluster" key={`${cluster.key}-${index}`}>
+        <div className="root-time-cluster-label">{cluster.label}</div>
+        {cluster.roots.map(renderRootItem)}
+      </div>
+    ));
+  };
+
   const renderGroupSection = (
     id: string | null,
     name: string,
     collapsed: boolean,
     items: Root[],
-    opts?: { groupId?: string },
+    opts?: { groupId?: string; group?: GroupTreeNode; depth?: number },
   ) => {
     const targetGroupId = id === DEFAULT_GROUP_ID ? null : id;
     const dragKey = getGroupDragKey(targetGroupId);
+    const depth = opts?.depth || 0;
+    const childGroups = opts?.group?.children || [];
+    const canDragGroup = !!opts?.groupId;
     return (
-      <div className={`sidebar-group ${dragOverGroupId === dragKey ? 'drag-over' : ''}`} key={id || DEFAULT_GROUP_ID}>
+      <div
+        className={`sidebar-group ${dragOverGroupId === dragKey ? 'drag-over' : ''} ${dragGroupId === opts?.groupId ? 'dragging' : ''}`}
+        key={id || DEFAULT_GROUP_ID}
+        style={{ '--group-depth': depth } as CSSProperties}
+      >
         <div
           className={`sidebar-section-title sidebar-group-title ${opts?.groupId ? 'has-actions' : 'no-actions'}`}
+          draggable={canDragGroup}
+          onDragStart={canDragGroup && opts?.group ? e => handleGroupDragStart(e, opts.group!) : undefined}
+          onDragEnd={canDragGroup ? clearDragState : undefined}
           onDragOver={e => handleGroupDragOver(e, targetGroupId)}
-          onDrop={e => handleDropRoot(e, targetGroupId)}
+          onDrop={e => handleDropOnGroup(e, targetGroupId)}
         >
           <button
             className="sidebar-group-collapse"
+            draggable={false}
             onClick={() => opts?.groupId
-              ? updateRootGroup(opts.groupId, { collapsed: collapsed ? 0 : 1 } as any)
+              ? persistInBackground(
+                  updateRootGroup(opts.groupId, { collapsed: collapsed ? 0 : 1 }),
+                  'toggle group',
+                )
               : setDefaultGroupCollapsed(v => !v)}
             title={collapsed ? t('expandGroup') : t('collapseGroup')}
           >
@@ -512,10 +750,20 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
           <span>{name}</span>
           {opts?.groupId && (
             <div className="sidebar-group-actions">
-              <button onClick={() => handleRenameGroup(opts.groupId!, name)} title={t('renameGroup')}>
+              <button
+                onClick={async e => {
+                  e.stopPropagation();
+                  await handleCreateGroup(opts.groupId!);
+                }}
+                draggable={false}
+                title={t('newGroup')}
+              >
+                <FolderPlus size={13} />
+              </button>
+              <button draggable={false} onClick={e => { e.stopPropagation(); handleRenameGroup(opts.groupId!, name); }} title={t('renameGroup')}>
                 <Pencil size={13} />
               </button>
-              <button onClick={() => handleDeleteGroup(opts.groupId!)} title={t('delete')}>
+              <button draggable={false} onClick={e => { e.stopPropagation(); handleDeleteGroup(opts.groupId!); }} title={t('delete')}>
                 <X size={13} />
               </button>
             </div>
@@ -523,12 +771,25 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
           <span className="sidebar-group-count">{items.length}</span>
         </div>
         <div className={`sidebar-group-body ${collapsed ? 'collapsed' : 'expanded'}`}>
-          <div
-            className="root-list"
-            onDragOver={e => handleGroupDragOver(e, targetGroupId)}
-            onDrop={e => handleDropRoot(e, targetGroupId)}
-          >
-            {items.map(renderRootItem)}
+          <div className="sidebar-group-body-inner">
+            {childGroups.length > 0 && (
+              <div className="sidebar-group-children">
+                {childGroups.map(child => renderGroupSection(
+                  child.id,
+                  child.name,
+                  !!child.collapsed,
+                  rootsByGroup[child.id] || [],
+                  { groupId: child.id, group: child, depth: depth + 1 },
+                ))}
+              </div>
+            )}
+            <div
+              className="root-list"
+              onDragOver={e => handleGroupDragOver(e, targetGroupId)}
+              onDrop={e => handleDropOnGroup(e, targetGroupId)}
+            >
+              {renderRootListItems(items)}
+            </div>
           </div>
         </div>
       </div>
@@ -618,26 +879,35 @@ export default function Sidebar({ onConfigClick, onRootSelect }: Props) {
       </div>
 
       <div className="sidebar-group-toolbar">
-        <button onClick={handleCreateGroup} title={t('newGroup')}>
+        <button onClick={() => handleCreateGroup()} title={t('newGroup')}>
           <FolderPlus size={15} />
           <span>{t('newGroup')}</span>
         </button>
       </div>
 
-      <div className="sidebar-groups">
+      <div
+        className="sidebar-groups"
+        ref={sidebarGroupsRef}
+        onScroll={maybeLoadMoreRoots}
+        onDragOver={handleGroupsDragOver}
+        onDragLeave={handleGroupsDragLeave}
+      >
         {renderRecentGroup()}
-        {rootGroups.map(group => renderGroupSection(
+        {groupTree.map(group => renderGroupSection(
           group.id,
           group.name,
           !!group.collapsed,
           rootsByGroup[group.id] || [],
-          { groupId: group.id },
+          { groupId: group.id, group, depth: 0 },
         ))}
         {renderGroupSection(
           DEFAULT_GROUP_ID,
           t('chats'),
           defaultGroupCollapsed,
           rootsByGroup[DEFAULT_GROUP_ID] || [],
+        )}
+        {rootsLoadingMore && (
+          <div className="sidebar-roots-loading">{t('loading')}</div>
         )}
       </div>
     </>

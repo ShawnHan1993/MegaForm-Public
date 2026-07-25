@@ -9,7 +9,7 @@
  * - 发送消息（区分新问题树 / 递进关系两种场景）
  * - 错误信息展示与清除
  */
-import { useState, useRef, useEffect, useLayoutEffect, useMemo, type FormEvent } from 'react';
+import { useState, useRef, useEffect, useLayoutEffect, useMemo, type ClipboardEvent, type FormEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { useAppStore } from '../store/appStore';
 import { getThinkingDepthClass, getThinkingLevels, type ThinkingLevel } from '../data/thinkingPresets';
@@ -17,7 +17,7 @@ import type { Node as RootNode } from '../types';
 import { SearchOutlined } from '@ant-design/icons';
 import { Activity, X, AlertTriangle, ArrowUp, UserRound, FileUp, Link2, Image as ImageIcon, Camera, Plus } from 'lucide-react';
 import { localizeThinkingDescription, localizeThinkingLabel, useLanguage, useT } from '../i18n';
-import { fileToDataUrl, isSupportedImageFile, modelSupportsImageInput, type ImageAttachment } from '../utils/multimodal';
+import { fileToDataUrl, getClipboardImageFile, isSupportedImageFile, modelSupportsImageInput, type ImageAttachment } from '../utils/multimodal';
 
 const INPUT_MAX_HEIGHT = 200;  // textarea 最高上限 px
 type ThinkingPopoverPosition = { left: number; bottom: number } | null;
@@ -460,6 +460,14 @@ export default function InputBar() {
     }
   };
 
+  const handleImagePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    if (isChildProgressionNode || sendingMessage) return;
+    const file = getClipboardImageFile(event.clipboardData);
+    if (!file) return;
+    event.preventDefault();
+    void handleImageSelected(file);
+  };
+
   const handleUploadSubmit = async (e: FormEvent) => {
     e.preventDefault();
     const url = uploadUrl.trim();
@@ -585,6 +593,7 @@ export default function InputBar() {
               if (isChildProgressionNode) return;
               setInput(e.target.value);
             }}
+            onPaste={handleImagePaste}
             onKeyDown={e => {
               if (isChildProgressionNode) return;
               if (e.key === 'Enter' && !e.shiftKey) {

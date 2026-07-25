@@ -12,8 +12,12 @@ import { getNutReferenceText } from '../utils/referenceText';
 const LS_COLLAPSED_PREFIX = 'megaform-collapsed-';
 const RECENT_NODE_LIMIT = 10;
 const RECENT_NODE_UPDATE_DELAY_MS = 1000;
+const ROOTS_PAGE_SIZE = 120;
+const INITIAL_ROOTS_DAYS = 30;
 const AUTO_COLLAPSE_NODE_THRESHOLD = 120;
 const recentNodeUpdateTimers = new Map<string, number>();
+const rootGroupMutationQueues = new Map<string, Promise<void>>();
+const rootMoveMutationQueues = new Map<string, Promise<void>>();
 
 function hasCollapsedSetPreference(rootId: string): boolean {
   try {
@@ -399,12 +403,29 @@ function patchRecentNodeSummary(recentNodes: Node[], nodeId: string, summary: st
   return { recentNodes: nextRecentNodes, patched };
 }
 
+function initialRootsUpdatedAfter(): string {
+  return new Date(Date.now() - INITIAL_ROOTS_DAYS * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function mergeRootsById(existing: Root[], incoming: Root[]): Root[] {
+  const map = new Map<string, Root>();
+  for (const root of existing) map.set(root.id, root);
+  for (const root of incoming) map.set(root.id, root);
+  return Array.from(map.values()).sort((a, b) => {
+    const timeDiff = new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+    return timeDiff !== 0 ? timeDiff : b.id.localeCompare(a.id);
+  });
+}
+
 export interface AppState {
   // ── 问题 ──
   /** 问题树列表（按更新时间倒序排列） */
   roots: Root[];
   /** 侧边栏自定义分组 */
   rootGroups: RootGroup[];
+  rootsNextCursor: string | null;
+  rootsHasMore: boolean;
+  rootsLoadingMore: boolean;
   /** 当前打开的问题树 ID（null 表示未打开任何问题） */
   currentRootId: string | null;
   /** 当前问题树的树形结构（null 表示未加载） */
@@ -433,6 +454,8 @@ export interface AppState {
   collapsedSet: Set<string>;
   /** 沉浸式隐藏集合：隐藏某个父节点下的追问子节点（沉浸式阅读） */
   immersiveHiddenSet: Set<string>;
+  /** 专注阅读当前绑定的问题节点；null 表示普通浏览模式 */
+  focusReadingNodeId: string | null;
   /** 模型深度思考预算 {model_id: budget}，0=关闭深度思考 */
   thinkingBudgets: Record<string, number>;
   /** 联网搜索开关（持久于数据库 settings 表） */
@@ -486,8 +509,10 @@ export interface AppState {
   // ── Actions ──
   /** 获取问题树列表 */
   fetchRoots: () => Promise<void>;
+  /** 分页加载更旧的问题树 */
+  loadMoreRoots: () => Promise<void>;
   /** 新建侧边栏分组 */
-  createRootGroup: (name: string) => Promise<void>;
+  createRootGroup: (name: string, parentId?: string | null) => Promise<RootGroup>;
   /** 更新侧边栏分组 */
   updateRootGroup: (groupId: string, data: Partial<RootGroup>) => Promise<void>;
   /** 删除侧边栏分组，组内问题树回到“对话” */
@@ -511,12 +536,12 @@ export interface AppState {
   focusNode: (nodeId: string) => void;
   /** 切换节点折叠/展开 */
   toggleCollapse: (nodeId: string) => void;
-  /** 折叠所有节点（遍历树中所有可折叠节点） */
-  collapseAll: () => void;
   /** 将节点及所有后代设置为统一的折叠/展开状态 */
   setDescendantsCollapse: (nodeId: string, collapsed: boolean) => void;
   /** 切换沉浸式隐藏：隐藏/显示某父节点下的追问子节点 */
   toggleImmersive: (nodeId: string) => void;
+  /** 进入或退出专注阅读 */
+  setFocusReadingNode: (nodeId: string | null) => void;
 
   /**
    * 发送消息（流式聊天）
@@ -650,6 +675,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   // ── 初始状态 ──
   roots: [],
   rootGroups: [],
+  rootsNextCursor: null,
+  rootsHasMore: false,
+  rootsLoadingMore: false,
   currentRootId: null,
   rootTree: null,
   recentNodes: [],
@@ -661,6 +689,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   activeModelId: {},
   collapsedSet: new Set(),
   immersiveHiddenSet: new Set(),
+  focusReadingNodeId: null,
   thinkingBudgets: {},
   webSearchEnabled: false,
   profileInjectionEnabled: true,
@@ -679,43 +708,161 @@ export const useAppStore = create<AppState>((set, get) => ({
   searchScrollTarget: null,
   inputFocusTrigger: 0,
 
-  /** 获取问题树列表，替换全局 roots */
+  /** 获取最近一批问题树，替换全局 roots */
   fetchRoots: async () => {
-    const [roots, rootGroups] = await Promise.all([
-      api.listRoots(),
+    const [page, rootGroups] = await Promise.all([
+      api.listRootsPage({
+        limit: ROOTS_PAGE_SIZE,
+        updatedAfter: initialRootsUpdatedAfter(),
+      }),
       api.listRootGroups(),
     ]);
-    set({ roots, rootGroups });
+    set({
+      roots: page.roots || [],
+      rootGroups,
+      rootsNextCursor: page.next_cursor || null,
+      rootsHasMore: !!page.has_more,
+      rootsLoadingMore: false,
+    });
   },
 
-  createRootGroup: async (name: string) => {
-    await api.createRootGroup({ name });
-    const rootGroups = await api.listRootGroups();
-    set({ rootGroups });
+  loadMoreRoots: async () => {
+    const { rootsHasMore, rootsLoadingMore, rootsNextCursor } = get();
+    if (!rootsHasMore || rootsLoadingMore) return;
+    set({ rootsLoadingMore: true });
+    try {
+      const page = await api.listRootsPage({
+        limit: ROOTS_PAGE_SIZE,
+        cursor: rootsNextCursor,
+      });
+      set(state => ({
+        roots: mergeRootsById(state.roots, page.roots || []),
+        rootsNextCursor: page.next_cursor || null,
+        rootsHasMore: !!page.has_more,
+        rootsLoadingMore: false,
+      }));
+    } catch (err) {
+      set({ rootsLoadingMore: false });
+      throw err;
+    }
+  },
+
+  createRootGroup: async (name: string, parentId?: string | null) => {
+    const group = await api.createRootGroup({ name, parent_id: parentId || null });
+    set(state => ({
+      rootGroups: [...state.rootGroups.filter(g => g.id !== group.id), group],
+    }));
+    return group;
   },
 
   updateRootGroup: async (groupId: string, data: Partial<RootGroup>) => {
-    const group = await api.updateRootGroup(groupId, data);
+    const previous = get().rootGroups.find(group => group.id === groupId);
+    if (!previous) return;
+
     set(state => ({
-      rootGroups: state.rootGroups.map(g => g.id === groupId ? group : g),
+      rootGroups: state.rootGroups.map(group => group.id === groupId ? { ...group, ...data } : group),
     }));
+
+    const operation = (rootGroupMutationQueues.get(groupId) || Promise.resolve())
+      .catch(() => undefined)
+      .then(async () => {
+        await api.updateRootGroup(groupId, data);
+      });
+    rootGroupMutationQueues.set(groupId, operation);
+
+    try {
+      await operation;
+    } catch (err) {
+      if (rootGroupMutationQueues.get(groupId) === operation) {
+        set(state => ({
+          rootGroups: state.rootGroups.map(group => {
+            if (group.id !== groupId) return group;
+            const rollback: Partial<RootGroup> = {};
+            for (const key of Object.keys(data) as (keyof RootGroup)[]) {
+              if (Object.is(group[key], data[key])) {
+                (rollback as Record<string, unknown>)[key] = previous[key];
+              }
+            }
+            return { ...group, ...rollback };
+          }),
+        }));
+      }
+      throw err;
+    } finally {
+      if (rootGroupMutationQueues.get(groupId) === operation) {
+        rootGroupMutationQueues.delete(groupId);
+      }
+    }
   },
 
   deleteRootGroup: async (groupId: string) => {
-    await api.deleteRootGroup(groupId);
-    const [roots, rootGroups] = await Promise.all([
-      api.listRoots(),
-      api.listRootGroups(),
-    ]);
-    set({ roots, rootGroups });
+    const previousGroups = get().rootGroups;
+    const previousRoots = get().roots;
+    const deletedIds = new Set<string>();
+    const collect = (id: string) => {
+      if (deletedIds.has(id)) return;
+      deletedIds.add(id);
+      previousGroups.filter(group => group.parent_id === id).forEach(group => collect(group.id));
+    };
+    collect(groupId);
+
+    set(state => ({
+      rootGroups: state.rootGroups.filter(group => !deletedIds.has(group.id)),
+      roots: state.roots.map(root => deletedIds.has(root.group_id || '')
+        ? { ...root, group_id: null, group_order: null }
+        : root),
+    }));
+
+    try {
+      await api.deleteRootGroup(groupId);
+    } catch (err) {
+      set(state => ({
+        rootGroups: [
+          ...state.rootGroups.filter(group => !deletedIds.has(group.id)),
+          ...previousGroups.filter(group => deletedIds.has(group.id)),
+        ],
+        roots: state.roots.map(root => {
+          const previous = previousRoots.find(item => item.id === root.id);
+          return previous && deletedIds.has(previous.group_id || '')
+            ? { ...root, group_id: previous.group_id, group_order: previous.group_order }
+            : root;
+        }),
+      }));
+      throw err;
+    }
   },
 
   moveRootToGroup: async (rootId: string, groupId: string | null) => {
-    await api.moveRootToGroup(rootId, {
-      group_id: groupId,
-    });
-    const roots = await api.listRoots();
-    set({ roots });
+    const previousGroupId = get().roots.find(root => root.id === rootId)?.group_id || null;
+    set(state => ({
+      roots: state.roots.map(root => root.id === rootId
+        ? { ...root, group_id: groupId, group_order: null }
+        : root),
+    }));
+
+    const operation = (rootMoveMutationQueues.get(rootId) || Promise.resolve())
+      .catch(() => undefined)
+      .then(async () => {
+        await api.moveRootToGroup(rootId, { group_id: groupId });
+      });
+    rootMoveMutationQueues.set(rootId, operation);
+
+    try {
+      await operation;
+    } catch (err) {
+      if (rootMoveMutationQueues.get(rootId) === operation) {
+        set(state => ({
+          roots: state.roots.map(root => root.id === rootId && root.group_id === groupId
+            ? { ...root, group_id: previousGroupId }
+            : root),
+        }));
+      }
+      throw err;
+    } finally {
+      if (rootMoveMutationQueues.get(rootId) === operation) {
+        rootMoveMutationQueues.delete(rootId);
+      }
+    }
   },
 
   fetchRecentNodes: async () => {
@@ -774,7 +921,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   openRoot: async (rootId: string, opts = {}) => {
     const shouldMarkRecent = opts.markRecent !== false;
     const hasCollapsePreference = hasCollapsedSetPreference(rootId);
-    set({ loading: true, treeLoading: true });
+    set({ loading: true, treeLoading: true, focusReadingNodeId: null });
     try {
       let rootReceived = false;
 
@@ -914,26 +1061,47 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   /** 删除问题树 */
   deleteRoot: async (rootId: string) => {
-    await api.deleteRoot(rootId);
+    const snapshot = get();
+    const deletedRoot = snapshot.roots.find(root => root.id === rootId);
+    const deletedRecentNodes = snapshot.recentNodes.filter(node => node.id === rootId || node.root_id === rootId);
+    const deletedRecentIds = deletedRecentNodes.map(node => node.id);
+    clearRecentNodeTimers([rootId, ...deletedRecentIds]);
+
     set(state => ({
       roots: state.roots.filter(t => t.id !== rootId),
       currentRootId: state.currentRootId === rootId ? null : state.currentRootId,
       rootTree: state.currentRootId === rootId ? null : state.rootTree,
       focusedNodeId: state.currentRootId === rootId ? null : state.focusedNodeId,
-      recentNodes: (() => {
-        const removedIds = state.recentNodes
-          .filter(n => n.id === rootId || n.root_id === rootId)
-          .map(n => n.id);
-        clearRecentNodeTimers([rootId, ...removedIds]);
-        const recentNodes = state.recentNodes.filter(n => n.id !== rootId && n.root_id !== rootId);
-        if (recentNodes.length !== state.recentNodes.length) {
-          api.saveRecentNodes(recentNodes.map(n => n.id)).catch(err => {
-            console.error('[recent-nodes] save failed:', err);
-          });
-        }
-        return recentNodes;
-      })(),
+      recentNodes: state.recentNodes.filter(n => n.id !== rootId && n.root_id !== rootId),
     }));
+
+    const persistRecent = () => api.saveRecentNodes(get().recentNodes.map(node => node.id)).catch(err => {
+      console.error('[recent-nodes] save failed:', err);
+    });
+    if (deletedRecentNodes.length > 0) void persistRecent();
+
+    try {
+      await api.deleteRoot(rootId);
+    } catch (err) {
+      set(state => ({
+        roots: deletedRoot ? mergeRootsById(state.roots, [deletedRoot]) : state.roots,
+        currentRootId: snapshot.currentRootId === rootId && state.currentRootId === null
+          ? snapshot.currentRootId
+          : state.currentRootId,
+        rootTree: snapshot.currentRootId === rootId && state.currentRootId === null
+          ? snapshot.rootTree
+          : state.rootTree,
+        focusedNodeId: snapshot.currentRootId === rootId && state.currentRootId === null
+          ? snapshot.focusedNodeId
+          : state.focusedNodeId,
+        recentNodes: [
+          ...deletedRecentNodes,
+          ...state.recentNodes.filter(node => !deletedRecentIds.includes(node.id)),
+        ].slice(0, RECENT_NODE_LIMIT),
+      }));
+      if (deletedRecentNodes.length > 0) void persistRecent();
+      throw err;
+    }
   },
 
   /** 设置聚焦节点 */
@@ -956,22 +1124,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       saveCollapsedSet(state.currentRootId, next);
       return { collapsedSet: next };
     });
-  },
-
-  /** 全部折叠 */
-  collapseAll: () => {
-    const { rootTree, currentRootId } = get();
-    if (!rootTree) return;
-    const ids = new Set<string>();
-    const walk = (nodes: Node[]) => {
-      for (const n of nodes) {
-        if (canCollapseNode(n)) ids.add(n.id);
-        if (n.children) walk(n.children);
-      }
-    };
-    walk(rootTree);
-    saveCollapsedSet(currentRootId, ids);
-    set({ collapsedSet: ids });
   },
 
   /** 将节点及所有后代设置为统一的折叠/展开状态 */
@@ -1022,8 +1174,16 @@ export const useAppStore = create<AppState>((set, get) => ({
     });
   },
 
+  setFocusReadingNode: (nodeId: string | null) => set({ focusReadingNodeId: nodeId }),
+
   sendMessage: async (content, opts) => {
-    const { selectedModelIds, thinkingBudgets, webSearchEnabled, profileInjectionEnabled } = get();
+    const {
+      selectedModelIds,
+      thinkingBudgets,
+      webSearchEnabled,
+      profileInjectionEnabled,
+      focusReadingNodeId: focusReadingNodeBeforeSend,
+    } = get();
     if (!content.trim()) return;
 
     const useWebSearch = opts.webSearch !== undefined ? opts.webSearch : webSearchEnabled;
@@ -1047,6 +1207,11 @@ export const useAppStore = create<AppState>((set, get) => ({
     // ── 设置流式状态 ──
     const pendingNodeId = `pending-${Date.now()}`;
     const switchFocus = opts.relation === 'followup' || !opts.parentId;
+    const shouldMoveFocusReadingToCreatedNode = Boolean(
+      switchFocus
+      && focusReadingNodeBeforeSend
+      && (!opts.parentId || focusReadingNodeBeforeSend === opts.parentId),
+    );
     set(state => ({
       sendingMessage: true,
       streamingNodeIds: new Set([...state.streamingNodeIds, pendingNodeId]),
@@ -1145,6 +1310,12 @@ export const useAppStore = create<AppState>((set, get) => ({
               streamingNutId: nutIdMap,
               streamingRelation: relMap,
               focusedNodeId: switchFocus ? nodeId : (opts.parentId || nodeId),
+              focusReadingNodeId: (
+                shouldMoveFocusReadingToCreatedNode
+                && prev.focusReadingNodeId === focusReadingNodeBeforeSend
+              )
+                ? nodeId
+                : prev.focusReadingNodeId,
               scrollToNodeId: switchFocus ? null : nodeId,
               currentRootId: rootId || prev.currentRootId,
               rootTree: tree.length ? tree : prev.rootTree,
@@ -2970,6 +3141,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     focusedNodeId: null,
     collapsedSet: new Set(),
     immersiveHiddenSet: new Set(),
+    focusReadingNodeId: null,
     streamingNodeIds: new Set(),
     streamingContent: {},
     streamingResponses: {},
@@ -3006,8 +3178,6 @@ export const useAppStore = create<AppState>((set, get) => ({
           rootTree: null,
           focusedNodeId: null,
         }));
-        const roots = await api.listRoots();
-        set({ roots });
       } else {
         const { currentRootId } = get();
         if (currentRootId) {

@@ -19,7 +19,7 @@
  *   - React.memo on MarkdownContent: 防止 setSelectionInfo 导致的 text 节点替换
  */
 
-import { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo } from 'react';
+import { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo, type ClipboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useAppStore } from '../store/appStore';
@@ -30,6 +30,7 @@ import NodeCard from './NodeCard';
 import { ArrowRightFromLine, Search, Activity, X, Pin, PinOff, AlertTriangle, CheckCircle2, Plus, ArrowUp } from 'lucide-react';
 import { localizeThinkingDescription, localizeThinkingLabel, useLanguage, useT } from '../i18n';
 import { findLatexRanges } from '../utils/latex';
+import { fileToDataUrl, getClipboardImageFile, isSupportedImageFile, modelSupportsImageInput, type ImageAttachment } from '../utils/multimodal';
 
 /** 将文本中所有裸 URL 替换为 Markdown 超链接（缩略展示，最多两层 path） */
 function formatUrlsInText(text: string): string {
@@ -256,8 +257,8 @@ function hasLatex(text: string): boolean {
   return /(\$\$[\s\S]+?\$\$|\$[^$\n]+?\$|\\\([\s\S]+?\\\)|\\\[[\s\S]+?\\\])/.test(text);
 }
 
-function getFollowupLabelPreview(text: string): string {
-  if (hasLatex(text)) return text;
+function getFollowupLabelPreview(text: string, containsImage = false): string {
+  if (containsImage || hasLatex(text)) return text;
   const chars = Array.from(text);
   return chars.length > 30 ? chars.slice(0, 30).join('') + '...' : text;
 }
@@ -294,6 +295,7 @@ interface RenderedSourcePiece {
   rawStart: number;
   rawEnd: number;
   textLength: number;
+  kind: 'text' | 'image';
 }
 
 function findRenderedPieceInRaw(rawContent: string, text: string, rawCursor: number): { start: number; end: number } | null {
@@ -317,6 +319,51 @@ function findRenderedPieceInRaw(rawContent: string, text: string, rawCursor: num
   return null;
 }
 
+function findClosingMarkdownDelimiter(
+  content: string,
+  start: number,
+  opening: '[' | '(',
+  closing: ']' | ')',
+): number {
+  let depth = 0;
+  for (let index = start; index < content.length; index++) {
+    const char = content[index];
+    if (char === '\\') {
+      index++;
+      continue;
+    }
+    if (char === opening) {
+      depth++;
+    } else if (char === closing) {
+      depth--;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+function findNextMarkdownImageRange(rawContent: string, rawCursor: number): { start: number; end: number } | null {
+  let imageStart = rawContent.indexOf('![', rawCursor);
+  while (imageStart >= 0) {
+    const altEnd = findClosingMarkdownDelimiter(rawContent, imageStart + 1, '[', ']');
+    if (altEnd < 0) return null;
+
+    let targetStart = altEnd + 1;
+    while (targetStart < rawContent.length && /[ \t]/.test(rawContent[targetStart])) targetStart++;
+
+    if (rawContent[targetStart] === '(') {
+      const targetEnd = findClosingMarkdownDelimiter(rawContent, targetStart, '(', ')');
+      if (targetEnd >= 0) return { start: imageStart, end: targetEnd + 1 };
+    } else if (rawContent[targetStart] === '[') {
+      const targetEnd = findClosingMarkdownDelimiter(rawContent, targetStart, '[', ']');
+      if (targetEnd >= 0) return { start: imageStart, end: targetEnd + 1 };
+    }
+
+    imageStart = rawContent.indexOf('![', altEnd + 1);
+  }
+  return null;
+}
+
 function buildRenderedSourcePieces(root: Element, rawContent: string): RenderedSourcePiece[] {
   const pieces: RenderedSourcePiece[] = [];
   let rawCursor = 0;
@@ -332,6 +379,7 @@ function buildRenderedSourcePieces(root: Element, rawContent: string): RenderedS
       rawStart: found.start,
       rawEnd: found.end,
       textLength: text.length,
+      kind: 'text',
     });
     rawCursor = found.end;
   };
@@ -356,6 +404,21 @@ function buildRenderedSourcePieces(root: Element, rawContent: string): RenderedS
 
     if (element instanceof HTMLElement && element.matches('.latex-source[data-latex-source]')) {
       addPiece(element, element.dataset.latexSource || '');
+      return;
+    }
+
+    if (element instanceof HTMLImageElement) {
+      const found = findNextMarkdownImageRange(rawContent, rawCursor);
+      if (found) {
+        pieces.push({
+          node: element,
+          rawStart: found.start,
+          rawEnd: found.end,
+          textLength: 1,
+          kind: 'image',
+        });
+        rawCursor = found.end;
+      }
       return;
     }
 
@@ -397,6 +460,8 @@ function getBoundaryRawOffset(
   }
 
   if (container.nodeType !== Node.ELEMENT_NODE && container !== root) return null;
+  const directPiece = pieces.find(item => item.node === container);
+  if (directPiece) return endBoundary ? directPiece.rawEnd : directPiece.rawStart;
   const children = Array.from(container.childNodes);
 
   if (endBoundary) {
@@ -422,7 +487,10 @@ function getBoundaryRawOffset(
   return pieces[0]?.rawStart ?? null;
 }
 
-function getSelectionSourceRange(range: Range, rawContent: string): { start: number; end: number } | null {
+function getSelectionSourceRange(
+  range: Range,
+  rawContent: string,
+): { start: number; end: number; containsImage: boolean } | null {
   const startElement = range.startContainer.nodeType === Node.ELEMENT_NODE
     ? range.startContainer as Element
     : range.startContainer.parentElement;
@@ -449,6 +517,11 @@ function getSelectionSourceRange(range: Range, rawContent: string): { start: num
   return {
     start: Math.max(0, Math.min(contentOffset + localStart, rawContent.length)),
     end: Math.max(0, Math.min(contentOffset + localEnd, rawContent.length)),
+    containsImage: pieces.some(piece => (
+      piece.kind === 'image' &&
+      piece.rawStart < localEnd &&
+      piece.rawEnd > localStart
+    )),
   };
 }
 
@@ -457,6 +530,7 @@ interface Props {
   responses: RespType[];
   followupChildren: Node[];
   immersive?: boolean;
+  focusReading?: boolean;
   /** 流式响应数据（{modelId: StreamingResponse}），非空时表示该节点正在流式输出 */
   streamingResponses?: Record<string, import('../types').StreamingResponse>;
   /** 当前节点是否正在流式 */
@@ -470,8 +544,8 @@ interface Props {
  * 
  * 切割策略：
  * 1. 在 nut.end_seek 处找到当前行的末尾（同一行的文本归入 before 段）
- * 2. 如果 nut 落在 Markdown 表格内，找到表格结束位置再插入 followup
- * 3. 同一表格内的多个 nut，其 followup 在表格结束后依次排列
+ * 2. 如果 nut 落在 Markdown 表格或 fenced code block 内，在整个块结束后插入
+ * 3. 同一块内的多个 nut，其 followup 在块结束后依次排列
  * 4. followup 卡片插入在当前行末尾之后、下一行之前
  */
 interface MarkdownSegment {
@@ -523,6 +597,30 @@ function splitContentAtNuts(
   const segments: Segment[] = [];
   let lastEnd = 0;
   const latexRanges = findLatexRanges(content);
+
+  interface SourceRange { start: number; end: number }
+  const codeBlockRanges: SourceRange[] = [];
+  const fencePattern = /^( {0,3})(`{3,}|~{3,})([^\n]*)(?:\n|$)/gm;
+  let openFence: { start: number; marker: string } | null = null;
+  let fenceMatch: RegExpExecArray | null;
+  while ((fenceMatch = fencePattern.exec(content)) !== null) {
+    const fence = fenceMatch[2];
+    const suffix = fenceMatch[3];
+    if (!openFence) {
+      openFence = { start: fenceMatch.index, marker: fence[0].repeat(fence.length) };
+    } else if (
+      fence[0] === openFence.marker[0] &&
+      fence.length >= openFence.marker.length &&
+      suffix.trim() === ''
+    ) {
+      codeBlockRanges.push({ start: openFence.start, end: fencePattern.lastIndex });
+      openFence = null;
+    }
+  }
+  if (openFence) codeBlockRanges.push({ start: openFence.start, end: content.length });
+
+  const codeBlockAt = (pos: number): SourceRange | undefined =>
+    codeBlockRanges.find(range => pos >= range.start && pos <= range.end);
 
   const expandSplitPointPastLatex = (pos: number): number => {
     let splitPoint = pos;
@@ -580,7 +678,6 @@ function splitContentAtNuts(
   interface NutGroup {
     nuts: Nut[];
     splitPoint: number;
-    inTable: boolean;
   }
 
   const groups: NutGroup[] = [];
@@ -589,7 +686,17 @@ function splitContentAtNuts(
     const nut = activeNuts[i];
     const nutEnd = Math.min(nut.end_seek, content.length);
 
-    if (isInTable(nutEnd)) {
+    const codeBlock = codeBlockAt(nutEnd);
+    if (codeBlock) {
+      const codeNuts = [nut];
+      let j = i + 1;
+      while (j < activeNuts.length && codeBlockAt(Math.min(activeNuts[j].end_seek, content.length)) === codeBlock) {
+        codeNuts.push(activeNuts[j]);
+        j++;
+      }
+      groups.push({ nuts: codeNuts, splitPoint: codeBlock.end });
+      i = j;
+    } else if (isInTable(nutEnd)) {
       // 找到表格结束位置
       const tableEnd = findTableEnd(nutEnd);
       // 收集同一表格内的后续 nut
@@ -604,10 +711,10 @@ function splitContentAtNuts(
           break;
         }
       }
-      groups.push({ nuts: tableNuts, splitPoint: tableEnd, inTable: true });
+      groups.push({ nuts: tableNuts, splitPoint: tableEnd });
       i = j;
     } else {
-      groups.push({ nuts: [nut], splitPoint: findLineEnd(nutEnd), inTable: false });
+      groups.push({ nuts: [nut], splitPoint: findLineEnd(nutEnd) });
       i++;
     }
   }
@@ -651,6 +758,7 @@ export default function ResponseArea({
   responses,
   followupChildren,
   immersive,
+  focusReading = false,
   streamingResponses,
   isStreamingNode,
   suppressModelChipAnimation = false,
@@ -703,9 +811,11 @@ export default function ResponseArea({
   const deleteNode = useAppStore(s => s.deleteNode);
   const collapsedSet = useAppStore(s => s.collapsedSet);
   const toggleCollapse = useAppStore(s => s.toggleCollapse);
-  const focusNode = useAppStore(s => s.focusNode);
+  const setFocusReadingNode = useAppStore(s => s.setFocusReadingNode);
   const getDeepestPathModels = useAppStore(s => s.getDeepestPathModels);
   const searchScrollTarget = useAppStore(s => s.searchScrollTarget);
+  const focusFollowupChildrenRef = useRef(followupChildren);
+  focusFollowupChildrenRef.current = followupChildren;
 
   // ━━━ 文本选择追问状态 ━━━
   // selectionInfo: 当前选中文字的位置+元信息
@@ -724,8 +834,11 @@ export default function ResponseArea({
     modelId: string;
     seek: number;
     endSeek: number;
+    containsImage: boolean;
   } | null>(null);
   const [followupInput, setFollowupInput] = useState('');
+  const [followupImageAttachment, setFollowupImageAttachment] = useState<ImageAttachment | null>(null);
+  const [followupImageError, setFollowupImageError] = useState('');
   const [showFollowupInput, setShowFollowupInput] = useState(false);
   const responseAreaRef = useRef<HTMLDivElement>(null);
   const pendingHighlightRef = useRef<Range | null>(null);
@@ -944,6 +1057,48 @@ export default function ResponseArea({
   // 滚动时触发重渲染，使 tooltip 位置跟随文字
   const [scrollTick, setScrollTick] = useState(0);
 
+  const followupRequiresImageInput = Boolean(followupImageAttachment || selectionInfo?.containsImage);
+
+  useEffect(() => {
+    if (!showFollowupInput || !followupRequiresImageInput) return;
+    const supportedIds = new Set(followupVisibleModels.filter(modelSupportsImageInput).map(model => model.id));
+    const filtered = selectedModelIds.filter(id => supportedIds.has(id));
+    if (filtered.length !== selectedModelIds.length) {
+      setSelectedModelIds(filtered);
+    }
+  }, [showFollowupInput, followupRequiresImageInput, followupVisibleModels, selectedModelIds, setSelectedModelIds]);
+
+  const handleFollowupImageSelected = async (file: File) => {
+    if (!isSupportedImageFile(file)) {
+      setFollowupImageError(language === 'en' ? 'Supported images: PNG, JPEG, WEBP, GIF.' : '支持 PNG、JPEG、WEBP、GIF 图片');
+      return;
+    }
+    if (file.size > 8 * 1024 * 1024) {
+      setFollowupImageError(language === 'en' ? 'Image must be smaller than 8 MB.' : '图片需小于 8 MB');
+      return;
+    }
+    try {
+      const dataUrl = await fileToDataUrl(file);
+      setFollowupImageAttachment({
+        type: 'image',
+        name: file.name || 'clipboard-image',
+        mime_type: file.type || 'image/jpeg',
+        data_url: dataUrl,
+        size: file.size,
+      });
+      setFollowupImageError('');
+    } catch {
+      setFollowupImageError(language === 'en' ? 'Failed to read image.' : '读取图片失败');
+    }
+  };
+
+  const handleFollowupImagePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const file = getClipboardImageFile(event.clipboardData);
+    if (!file) return;
+    event.preventDefault();
+    void handleFollowupImageSelected(file);
+  };
+
   // ── 流式完成后保留最终态（思考区 + ✓完成 badge） ──
   const [completedStreaming, setCompletedStreaming] = useState<Record<string, import('../types').StreamingResponse>>({});
   useEffect(() => {
@@ -1143,6 +1298,18 @@ export default function ResponseArea({
     }
   }, [followupChildren, toggleCollapse]);
 
+  const handleFocusNutOpen = useCallback((nutId: string) => {
+    const targetNode = focusFollowupChildrenRef.current
+      .filter(node => node.nut_id === nutId)
+      .sort((left, right) => left.child_order - right.child_order)[0];
+    if (!targetNode) return;
+
+    window.dispatchEvent(new CustomEvent('megaform:drill-node', {
+      detail: { nodeId: targetNode.id },
+    }));
+    setFocusReadingNode(targetNode.id);
+  }, [setFocusReadingNode]);
+
   // ── 渲染带嵌入 followup 的 response 内容 ──
   const renderContentWithInlineFollowups = (
     response: RespType,
@@ -1211,6 +1378,24 @@ export default function ResponseArea({
           pendingNutIds.add(PENDING_NUT_ID);
         }
       }
+    }
+
+    if (focusReading) {
+      const focusNuts = nuts.filter(nut => (
+        nut.id !== PENDING_NUT_ID
+        && followupByNutId.has(nut.id)
+      ));
+      const focusNutIds = new Set(focusNuts.map(nut => nut.id));
+      return (
+        <MarkdownContent
+          content={response.content}
+          highlightedNuts={focusNuts}
+          focusNutIds={focusNutIds}
+          onFocusNutOpen={handleFocusNutOpen}
+          searchQuery={responseSearchHit?.query}
+          searchHitId={responseSearchHit?.hitId}
+        />
+      );
     }
 
     const segments = splitContentAtNuts(response.content, nuts, followupByNutId);
@@ -1355,8 +1540,7 @@ export default function ResponseArea({
         return false;
       }
 
-      const selectedText = getFollowupSelectionText(selection);
-      if (!selectedText) return false;
+      const renderedSelectionText = getFollowupSelectionText(selection);
 
       const sourceRange = selection.getRangeAt(0);
       const element = getElementForRange(sourceRange);
@@ -1389,6 +1573,9 @@ export default function ResponseArea({
 
       const anchorRange = getSelectionSourceRange(range, response.content);
       if (!anchorRange) return false;
+      const selectedSource = response.content.slice(anchorRange.start, anchorRange.end).trim();
+      const selectedText = anchorRange.containsImage ? selectedSource : renderedSelectionText;
+      if (!selectedText) return false;
 
       // 获取选区最后一个字符的视口位置（用于定位 tooltip）
       let viewportX = focusRect?.right ?? rect.right;
@@ -1434,6 +1621,7 @@ export default function ResponseArea({
         modelId,
         seek: anchorRange.start,
         endSeek: anchorRange.end,
+        containsImage: anchorRange.containsImage,
       });
       // 短暂标记，防止 selectionchange 立刻清除
       setTimeout(() => { justSetSelection = false; }, 100);
@@ -1555,6 +1743,8 @@ export default function ResponseArea({
     pendingHighlightRef.current = true as any;
     setShowFollowupInput(true);
     setFollowupInput('');
+    setFollowupImageAttachment(null);
+    setFollowupImageError('');
   };
 
   // 清除选区高亮
@@ -1576,11 +1766,19 @@ export default function ResponseArea({
   // 发送追问: 创建 pendingFollowup (loading 态) → API 调用 → 创建 followup 节点
   const submitFollowup = async () => {
     if (!selectionInfo || !currentRootId) return;
+    const compatibleModelIds = followupRequiresImageInput
+      ? selectedModelIds.filter(id => modelSupportsImageInput(followupVisibleModels.find(model => model.id === id)))
+      : selectedModelIds;
+    if (followupRequiresImageInput && compatibleModelIds.length === 0) {
+      setFollowupImageError(language === 'en' ? 'Choose at least one model that supports image input.' : '请选择至少一个支持图片输入的模型');
+      return;
+    }
 
     const savedFollowupInput = followupInput.trim()
       ? followupInput
       : t('defaultFollowupExplainMeaning');
     const savedSelectionInfo = { ...selectionInfo };
+    const savedAttachments = followupImageAttachment ? [followupImageAttachment] : undefined;
 
     setSendingFollowup(true);
     setPendingFollowup({
@@ -1597,6 +1795,8 @@ export default function ResponseArea({
     setSelectionInfo(null);
     setShowFollowupInput(false);
     setFollowupInput('');
+    setFollowupImageAttachment(null);
+    setFollowupImageError('');
 
     try {
       await sendMessage(savedFollowupInput, {
@@ -1607,14 +1807,45 @@ export default function ResponseArea({
         followupSeek: savedSelectionInfo.seek,
         followupEndSeek: savedSelectionInfo.endSeek,
         parentModelId: savedSelectionInfo.modelId,
-        modelIds: selectedModelIds.length > 0 ? selectedModelIds : undefined,
+        modelIds: compatibleModelIds.length > 0 ? compatibleModelIds : undefined,
         webSearch: webSearchEnabled,
+        attachments: savedAttachments,
       });
     } finally {
       setSendingFollowup(false);
       setPendingFollowup(null);
     }
   };
+
+  const renderFollowupImagePreview = () => (
+    <>
+      {followupImageAttachment && (
+        <div className="input-attachment-preview followup-attachment-preview">
+          <img src={followupImageAttachment.data_url} alt="" />
+          <div className="input-attachment-info">
+            <span>{followupImageAttachment.name}</span>
+            <small>{Math.max(1, Math.round(followupImageAttachment.size / 1024))} KB</small>
+          </div>
+          <button
+            type="button"
+            className="input-attachment-remove"
+            onClick={() => {
+              setFollowupImageAttachment(null);
+              setFollowupImageError('');
+            }}
+            aria-label={language === 'en' ? 'Remove image' : '移除图片'}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      )}
+      {followupImageError && (
+        <div className="followup-image-error">
+          <AlertTriangle size={12} /> {followupImageError}
+        </div>
+      )}
+    </>
+  );
 
   // 渲染单个 response card
   const renderResponseCard = (
@@ -1945,11 +2176,12 @@ export default function ResponseArea({
                   <div className="followup-bottom-inner">
                     <div className="followup-input-popup followup-mobile-composer">
                       <div className="followup-input-label">
-                        <MarkdownContent content={t('followupFor', { text: getFollowupLabelPreview(selectionInfo.text) })} inline />
+                        <MarkdownContent content={t('followupFor', { text: getFollowupLabelPreview(selectionInfo.text, selectionInfo.containsImage) })} inline />
                       </div>
                       <textarea
                         value={followupInput}
                         onChange={e => setFollowupInput(e.target.value)}
+                        onPaste={handleFollowupImagePaste}
                         onKeyDown={e => {
                           if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                             e.preventDefault();
@@ -1966,6 +2198,7 @@ export default function ResponseArea({
                         rows={2}
                         className="followup-composer-input"
                       />
+                      {renderFollowupImagePreview()}
                       <div className="followup-composer-toolbar">
                         <div className="followup-composer-tools">
                           {followupVisibleModels.map(m => {
@@ -1973,6 +2206,7 @@ export default function ResponseArea({
                             const thinkingLevels = getModelThinkingLevels(m);
                             const currentBudget = thinkingBudgets[m.id] || 0;
                             const hasThinking = thinkingLevels && thinkingLevels.length > 0;
+                            const disabledByImage = followupRequiresImageInput && !modelSupportsImageInput(m);
 
                             return (
                               <div
@@ -1987,7 +2221,9 @@ export default function ResponseArea({
                                 }}
                               >
                                 <button
-                                  className={`model-chip followup-tool-chip ${isSelected ? 'active' : ''}`}
+                                  className={`model-chip followup-tool-chip ${isSelected ? 'active' : ''} ${disabledByImage ? 'disabled-by-image' : ''}`}
+                                  disabled={disabledByImage}
+                                  title={disabledByImage ? (language === 'en' ? 'This model does not support image input' : '该模型不支持图片输入') : undefined}
                                   onClick={() => {
                                     if (isSelected) {
                                       setSelectedModelIds(selectedModelIds.filter(id => id !== m.id));
@@ -2078,6 +2314,7 @@ export default function ResponseArea({
                             onClick={submitFollowup}
                             className="followup-send-btn"
                             title={t('send')}
+                            disabled={sendingFollowup}
                           >
                             <ArrowUp size={17} />
                           </button>
@@ -2126,11 +2363,12 @@ export default function ResponseArea({
           {showFollowupInput && (
             <div className="followup-input-popup followup-expand-enter">
               <div className="followup-input-label">
-                <MarkdownContent content={t('followupFor', { text: getFollowupLabelPreview(selectionInfo.text) })} inline />
+                <MarkdownContent content={t('followupFor', { text: getFollowupLabelPreview(selectionInfo.text, selectionInfo.containsImage) })} inline />
               </div>
               <textarea
                 value={followupInput}
                 onChange={e => setFollowupInput(e.target.value)}
+                onPaste={handleFollowupImagePaste}
                 onKeyDown={e => {
                   if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                     e.preventDefault();
@@ -2147,6 +2385,7 @@ export default function ResponseArea({
                 rows={2}
                 className="followup-composer-input"
               />
+              {renderFollowupImagePreview()}
               <div className="followup-composer-toolbar">
                 <div className="followup-composer-tools">
                   {followupVisibleModels.map(m => {
@@ -2154,6 +2393,7 @@ export default function ResponseArea({
                     const thinkingLevels = getModelThinkingLevels(m);
                     const currentBudget = thinkingBudgets[m.id] || 0;
                     const hasThinking = thinkingLevels && thinkingLevels.length > 0;
+                    const disabledByImage = followupRequiresImageInput && !modelSupportsImageInput(m);
 
                     return (
                       <div
@@ -2168,7 +2408,9 @@ export default function ResponseArea({
                         }}
                       >
                         <button
-                          className={`model-chip followup-tool-chip ${isSelected ? 'active' : ''}`}
+                          className={`model-chip followup-tool-chip ${isSelected ? 'active' : ''} ${disabledByImage ? 'disabled-by-image' : ''}`}
+                          disabled={disabledByImage}
+                          title={disabledByImage ? (language === 'en' ? 'This model does not support image input' : '该模型不支持图片输入') : undefined}
                           onClick={() => {
                             if (isSelected) {
                               setSelectedModelIds(selectedModelIds.filter(id => id !== m.id));
@@ -2273,6 +2515,7 @@ export default function ResponseArea({
                     onClick={submitFollowup}
                     className="followup-send-btn"
                     title={t('send')}
+                    disabled={sendingFollowup}
                   >
                     <ArrowUp size={17} />
                   </button>

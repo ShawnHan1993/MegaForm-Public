@@ -1,5 +1,6 @@
-import { useEffect, useLayoutEffect, useRef, useState, type CSSProperties } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
+import { renderLatexToPlaceholders, restoreLatexPlaceholders } from '../utils/latex';
 
 type Placement = 'top' | 'bottom' | 'left' | 'right';
 
@@ -23,6 +24,20 @@ const SHOW_DELAY_MS = 140;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function renderTooltipLatexHtml(value: string): string {
+  const latexRendered = renderLatexToPlaceholders(value);
+  return restoreLatexPlaceholders(escapeHtml(latexRendered.content), latexRendered.html);
 }
 
 function findTooltipTarget(node: EventTarget | null): HTMLElement | null {
@@ -92,6 +107,13 @@ export default function VisualTooltip() {
   const showTimerRef = useRef<number | null>(null);
   const activeTargetRef = useRef<HTMLElement | null>(null);
   const lastTouchTimeRef = useRef(0);
+  const renderedTooltip = useMemo(() => {
+    if (!tooltip) return null;
+    return {
+      text: renderTooltipLatexHtml(tooltip.text),
+      quote: tooltip.quote ? renderTooltipLatexHtml(tooltip.quote) : null,
+    };
+  }, [tooltip]);
 
   const hideTooltip = () => {
     if (showTimerRef.current !== null) {
@@ -208,7 +230,7 @@ export default function VisualTooltip() {
     };
   }, [tooltip]);
 
-  if (!tooltip) return null;
+  if (!tooltip || !renderedTooltip) return null;
 
   return createPortal(
     <div
@@ -226,11 +248,20 @@ export default function VisualTooltip() {
     >
       {tooltip.quote ? (
         <>
-          <span className="visual-tooltip-quote">{tooltip.quote}</span>
-          <span className="visual-tooltip-body">{tooltip.text}</span>
+          <span
+            className="visual-tooltip-quote"
+            dangerouslySetInnerHTML={{ __html: renderedTooltip.quote || '' }}
+          />
+          <span
+            className="visual-tooltip-body"
+            dangerouslySetInnerHTML={{ __html: renderedTooltip.text }}
+          />
         </>
       ) : (
-        tooltip.text
+        <span
+          className="visual-tooltip-body"
+          dangerouslySetInnerHTML={{ __html: renderedTooltip.text }}
+        />
       )}
     </div>,
     document.body,

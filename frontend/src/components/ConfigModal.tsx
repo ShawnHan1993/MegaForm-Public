@@ -14,7 +14,7 @@ import { useAppStore } from '../store/appStore';
 import type { CurrentUser, ModelConfig, TokenUsage, UserProfileVersion } from '../types';
 import { api } from '../api/client';
 import { PROVIDER_PRESETS, getCurrencySymbol, type ProviderPreset, type ModelPreset } from '../data/providerPresets';
-import { X, Search, AlertTriangle, Activity, CheckCircle2, RefreshCcw, Loader, User, LogOut, FileText, History, Bot, Image as ImageIcon } from 'lucide-react';
+import { X, Search, AlertTriangle, Activity, CheckCircle2, RefreshCcw, Loader, User, LogOut, FileText, History, Bot, Image as ImageIcon, Cpu, BarChart3, Globe2, SlidersHorizontal } from 'lucide-react';
 import { LANGUAGES, getLanguage, localizePresetText, localizeSearchProviderText, useLanguage, useT, type Language } from '../i18n';
 import { modelPresetSupportsImageInput, modelSupportsImageInput, withImageInputCapability } from '../utils/multimodal';
 import { setMiniMapEnabled, useMiniMapEnabled } from '../utils/uiPreferences';
@@ -315,6 +315,9 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
   const [quickApiKey, setQuickApiKey] = useState('');
   const [quickProxyUrl, setQuickProxyUrl] = useState('');
   const [quickName, setQuickName] = useState('');  // 可编辑的模型标签
+  const [quickMaxTokens, setQuickMaxTokens] = useState('8192');
+  const [quickInputPrice, setQuickInputPrice] = useState('0');
+  const [quickOutputPrice, setQuickOutputPrice] = useState('0');
   const [customMode, setCustomMode] = useState(false);
 
   // ━━━ 动态模型发现 ━━━
@@ -327,6 +330,14 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
   const [hasDiscovered, setHasDiscovered] = useState(false);
   // 当用户从动态列表中选择了一个不在预设中的模型
   const [selectedDiscoveredModel, setSelectedDiscoveredModel] = useState<MergedModel | null>(null);
+
+  useEffect(() => {
+    const model = selectedModelPreset || selectedDiscoveredModel;
+    if (!model) return;
+    setQuickMaxTokens(String(model.max_tokens || 8192));
+    setQuickInputPrice(String(toPricePerMillionTokens(model.price_per_input)));
+    setQuickOutputPrice(String(toPricePerMillionTokens(model.price_per_output)));
+  }, [selectedModelPreset, selectedDiscoveredModel]);
 
   const [tokenUsage, setTokenUsage] = useState<TokenUsage[]>([]);
   const [tokenTotals, setTokenTotals] = useState<{ call_count: number; total_input: number; total_output: number; total_tokens: number; cumulative_usage: number } | null>(null);
@@ -427,6 +438,8 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
   const handleQuickAdd = async () => {
     const model = selectedModelPreset || selectedDiscoveredModel;
     if (!selectedProvider || !model) return;
+    const parsedMaxTokens = parseInt(quickMaxTokens, 10);
+    const maxTokens = Number.isFinite(parsedMaxTokens) && parsedMaxTokens > 0 ? parsedMaxTokens : (model.max_tokens || 8192);
     // 二次检查：防止在 Step 2→3 过程中已被其他方式添加
     if (isModelExists(model.model_name)) {
       alert(activeLanguage === 'en' ? `Model "${model.name}" already exists and cannot be added again` : `模型 "${model.name}" 已存在，无法重复添加`);
@@ -440,9 +453,9 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
       proxy_url: quickProxyUrl.trim(),
       api_key: quickApiKey || undefined,
       model_name: model.model_name,
-      max_tokens: model.max_tokens || 8192,
-      price_per_input: model.price_per_input ?? 0,
-      price_per_output: model.price_per_output ?? 0,
+      max_tokens: maxTokens,
+      price_per_input: fromPricePerMillionTokens(quickInputPrice),
+      price_per_output: fromPricePerMillionTokens(quickOutputPrice),
       price_unit: selectedProvider.currency,
       meta: JSON.stringify({
         capabilities: {
@@ -462,6 +475,9 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
     setQuickApiKey('');
     setQuickProxyUrl('');
     setQuickName('');
+    setQuickMaxTokens('8192');
+    setQuickInputPrice('0');
+    setQuickOutputPrice('0');
     setShowAdd(false);
     setEditingModel(null);
     setCustomMode(false);
@@ -551,59 +567,86 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
     <div className="config-overlay" onClick={onClose}>
       <div className="config-modal" onClick={e => e.stopPropagation()}>
         <div className="config-header">
-          <h2 style={{ margin: 0 }}>{t('config')}</h2>
-          <button onClick={onClose} className="config-close-btn"><X size={16} /></button>
+          <div className="config-heading">
+            <span className="config-heading-icon" aria-hidden="true"><SlidersHorizontal size={18} /></span>
+            <div>
+              <h2>{t('config')}</h2>
+              <p>{activeLanguage === 'en' ? 'Manage models, services, and preferences' : '管理模型、服务与个人偏好'}</p>
+            </div>
+          </div>
+          <button type="button" onClick={onClose} className="config-close-btn" aria-label={activeLanguage === 'en' ? 'Close settings' : '关闭设置'}><X size={18} /></button>
         </div>
 
         {/* Tabs */}
-        <div className="config-tabs">
+        <div className="config-tabs" role="tablist" aria-label={t('config')}>
           <button
+            type="button"
             onClick={() => setActiveTab('models')}
-            className={`model-chip ${activeTab === 'models' ? 'active' : ''}`}
+            className={`config-tab ${activeTab === 'models' ? 'active' : ''}`}
+            role="tab"
+            aria-selected={activeTab === 'models'}
           >
-            {t('modelConfig')}
+            <Cpu size={15} />
+            <span>{t('modelConfig')}</span>
           </button>
           <button
+            type="button"
             onClick={() => {
               setActiveTab('usage');
               loadUsage();
             }}
-            className={`model-chip ${activeTab === 'usage' ? 'active' : ''}`}
+            className={`config-tab ${activeTab === 'usage' ? 'active' : ''}`}
+            role="tab"
+            aria-selected={activeTab === 'usage'}
           >
-            {t('tokenUsage')}
+            <BarChart3 size={15} />
+            <span>{t('tokenUsage')}</span>
           </button>
           <button
+            type="button"
             onClick={() => {
               setActiveTab('search');
               if (!searchLoaded) loadSearchConfig();
             }}
-            className={`model-chip ${activeTab === 'search' ? 'active' : ''}`}
+            className={`config-tab ${activeTab === 'search' ? 'active' : ''}`}
+            role="tab"
+            aria-selected={activeTab === 'search'}
           >
-            {t('onlineSearch')}
+            <Globe2 size={15} />
+            <span>{t('onlineSearch')}</span>
           </button>
           <button
+            type="button"
             onClick={() => {
               setActiveTab('mineru');
               if (!mineruLoaded) loadMineruConfig();
             }}
-            className={`model-chip ${activeTab === 'mineru' ? 'active' : ''}`}
+            className={`config-tab ${activeTab === 'mineru' ? 'active' : ''}`}
+            role="tab"
+            aria-selected={activeTab === 'mineru'}
           >
-            MinerU PDF
+            <FileText size={15} />
+            <span>MinerU PDF</span>
           </button>
           <button
+            type="button"
             onClick={() => {
               setActiveTab('account');
               if (!accountSettingsLoaded) loadAccountSettings();
               if (!profileLoaded) loadProfile();
             }}
-            className={`model-chip ${activeTab === 'account' ? 'active' : ''}`}
+            className={`config-tab ${activeTab === 'account' ? 'active' : ''}`}
+            role="tab"
+            aria-selected={activeTab === 'account'}
           >
-            {t('account')}
+            <User size={15} />
+            <span>{t('account')}</span>
           </button>
         </div>
 
+        <div className="config-content">
         {activeTab === 'models' && (
-          <div>
+          <div className="config-tab-panel" role="tabpanel">
             <div className="summary-model-card">
               <div className="summary-model-main">
                 <div className="summary-model-copy">
@@ -852,7 +895,7 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                           </div>
                           <div className="qc-row">
                             <span className="qc-label">{t('displayName')}</span>
-                            <span className="qc-value">
+                            <span className="qc-value qc-field-stack">
                               <input
                                 className="qc-name-input"
                                 value={quickName}
@@ -884,21 +927,41 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                             </div>
                           )}
                           <div className="qc-row">
+                            <span className="qc-label">Max Tokens</span>
+                            <span className="qc-value qc-field-stack">
+                              <input
+                                type="number"
+                                min="1"
+                                step="1"
+                                className="qc-name-input"
+                                value={quickMaxTokens}
+                                onChange={e => setQuickMaxTokens(e.target.value)}
+                              />
+                            </span>
+                          </div>
+                          <div className="qc-row">
                             <span className="qc-label">{t('price')}</span>
-                            <span className="qc-value">
-                              {(() => {
-                                const m = selectedModelPreset || selectedDiscoveredModel;
-                                if (!m) return '-';
-                                if (m.price_per_input != null && m.price_per_input > 0) {
-                                  return t('priceInputOutput', {
-                                    currency: getCurrencySymbol(selectedProvider.id),
-                                    input: (m.price_per_input * 1000).toFixed(2),
-                                    output: (m.price_per_output! * 1000).toFixed(2),
-                                  });
-                                }
-                                if ('source' in m && m.source === 'api') return t('unknownPriceEditable');
-                                return t('free');
-                              })()}
+                            <span className="qc-value qc-price-fields">
+                              <label>
+                                <span>{t('inputPrice')} ({getCurrencySymbol(selectedProvider.id)}/1M)</span>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  step="0.01"
+                                  value={quickInputPrice}
+                                  onChange={e => setQuickInputPrice(e.target.value)}
+                                />
+                              </label>
+                              <label>
+                                <span>{t('outputPrice')} ({getCurrencySymbol(selectedProvider.id)}/1M)</span>
+                                <input
+                                  type="number"
+                                  min="0"
+                                  step="0.01"
+                                  value={quickOutputPrice}
+                                  onChange={e => setQuickOutputPrice(e.target.value)}
+                                />
+                              </label>
                             </span>
                           </div>
                         </div>
@@ -1060,23 +1123,41 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
         )}
 
         {activeTab === 'usage' && (
-          <div>
+          <div className="config-tab-panel" role="tabpanel">
             {!usageLoaded ? (
-              <p style={{ color: 'var(--megaform-text-secondary)', textAlign: 'center' }}>{t('loading')}</p>
+              <div className="config-empty-state"><Loader size={18} className="config-spinner" />{t('loading')}</div>
             ) : tokenUsage.length === 0 ? (
-              <p style={{ color: 'var(--megaform-text-secondary)', textAlign: 'center' }}>{t('noData')}</p>
+              <div className="config-empty-state"><BarChart3 size={22} />{t('noData')}</div>
             ) : (
-              <div style={{ overflowX: 'auto' }}>
-                <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+              <>
+                {tokenTotals && (
+                  <div className="usage-summary-grid">
+                    <div className="usage-summary-card">
+                      <span>{t('calls')}</span>
+                      <strong>{tokenTotals.call_count.toLocaleString()}</strong>
+                    </div>
+                    <div className="usage-summary-card">
+                      <span>{t('totalToken')}</span>
+                      <strong>{tokenTotals.total_tokens.toLocaleString()}</strong>
+                    </div>
+                    <div className="usage-summary-card">
+                      <span>{t('cumulativeCost')}</span>
+                      <strong>¥{(tokenTotals.cumulative_usage ?? 0).toFixed(4)}</strong>
+                    </div>
+                  </div>
+                )}
+                <div className="usage-table-card">
+                  <div className="usage-table-scroll">
+                  <table className="usage-table">
                   <thead>
-                    <tr style={{ borderBottom: '2px solid var(--megaform-border)' }}>
-                      <th style={{ textAlign: 'left', padding: '8px 6px' }}>{t('model')}</th>
-                      <th style={{ textAlign: 'right', padding: '8px 6px' }}>{t('calls')}</th>
-                      <th style={{ textAlign: 'right', padding: '8px 6px' }}>{t('inputTokens')}</th>
-                      <th style={{ textAlign: 'right', padding: '8px 6px' }}>{t('outputTokens')}</th>
-                      <th style={{ textAlign: 'right', padding: '8px 6px' }}>{t('totalToken')}</th>
-                      <th style={{ textAlign: 'right', padding: '8px 6px' }}>{t('cumulativeCost')}</th>
-                      <th style={{ textAlign: 'center', padding: '8px 6px', width: 70 }}>{t('actions')}</th>
+                    <tr>
+                      <th>{t('model')}</th>
+                      <th>{t('calls')}</th>
+                      <th>{t('inputTokens')}</th>
+                      <th>{t('outputTokens')}</th>
+                      <th>{t('totalToken')}</th>
+                      <th>{t('cumulativeCost')}</th>
+                      <th className="usage-action-column">{t('actions')}</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1089,129 +1170,129 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
                         return b.total_tokens - a.total_tokens;
                       })
                       .map((u: TokenUsage) => (
-                      <tr key={u.model_id} style={{ borderBottom: '1px solid var(--megaform-border)', opacity: u.deleted ? 0.4 : 1 }}>
-                        <td style={{ padding: '8px 6px' }}>{u.model_name}</td>
-                        <td style={{ textAlign: 'right', padding: '8px 6px' }}>{u.call_count}</td>
-                        <td style={{ textAlign: 'right', padding: '8px 6px' }}>{u.total_input.toLocaleString()}</td>
-                        <td style={{ textAlign: 'right', padding: '8px 6px' }}>{u.total_output.toLocaleString()}</td>
-                        <td style={{ textAlign: 'right', padding: '8px 6px' }}>{u.total_tokens.toLocaleString()}</td>
-                        <td style={{ textAlign: 'right', padding: '8px 6px', fontWeight: 600 }}>{u.price_unit === 'USD' ? '$' : '¥'}{(u.cumulative_usage ?? 0).toFixed(4)}</td>
-                        <td style={{ textAlign: 'center', padding: '8px 6px' }}>
+                      <tr key={u.model_id} className={u.deleted ? 'is-deleted' : ''}>
+                        <td className="usage-model-name">{u.model_name}</td>
+                        <td>{u.call_count.toLocaleString()}</td>
+                        <td>{u.total_input.toLocaleString()}</td>
+                        <td>{u.total_output.toLocaleString()}</td>
+                        <td>{u.total_tokens.toLocaleString()}</td>
+                        <td className="usage-cost">{u.price_unit === 'USD' ? '$' : '¥'}{(u.cumulative_usage ?? 0).toFixed(4)}</td>
+                        <td className="usage-action-column">
                           {u.deleted !== 1 && (
                           <button
+                            type="button"
                             onClick={e => { e.stopPropagation(); handleRecalculate(u.model_id); }}
                             disabled={recalculating.has(u.model_id)}
                             title={t('recalcUsage')}
-                            style={{
-                              background: 'none',
-                              border: '1px solid var(--megaform-border)',
-                              borderRadius: 4,
-                              cursor: 'pointer',
-                              fontSize: 12,
-                              padding: '2px 6px',
-                              color: 'var(--megaform-text-secondary)',
-                              whiteSpace: 'nowrap',
-                            }}
+                            className="config-icon-button"
                           >
-                            {recalculating.has(u.model_id) ? <Loader size={12} style={{verticalAlign:'-2px'}} /> : <RefreshCcw size={12} style={{verticalAlign:'-2px'}} />}
+                            {recalculating.has(u.model_id) ? <Loader size={13} className="config-spinner" /> : <RefreshCcw size={13} />}
                           </button>
                           )}
                         </td>
                       </tr>
                     ))}
                     {tokenTotals && (
-                      <tr style={{ borderTop: '2px solid var(--megaform-border)', fontWeight: 600 }}>
-                        <td style={{ padding: '8px 6px' }}>{t('total')}</td>
-                        <td style={{ textAlign: 'right', padding: '8px 6px' }}>{tokenTotals.call_count}</td>
-                        <td style={{ textAlign: 'right', padding: '8px 6px' }}>{tokenTotals.total_input.toLocaleString()}</td>
-                        <td style={{ textAlign: 'right', padding: '8px 6px' }}>{tokenTotals.total_output.toLocaleString()}</td>
-                        <td style={{ textAlign: 'right', padding: '8px 6px' }}>{tokenTotals.total_tokens.toLocaleString()}</td>
-                        <td style={{ textAlign: 'right', padding: '8px 6px', fontWeight: 600 }}>¥{(tokenTotals.cumulative_usage ?? 0).toFixed(4)}</td>
-                        <td style={{ textAlign: 'center', padding: '8px 6px' }}></td>
+                      <tr className="usage-total-row">
+                        <td>{t('total')}</td>
+                        <td>{tokenTotals.call_count.toLocaleString()}</td>
+                        <td>{tokenTotals.total_input.toLocaleString()}</td>
+                        <td>{tokenTotals.total_output.toLocaleString()}</td>
+                        <td>{tokenTotals.total_tokens.toLocaleString()}</td>
+                        <td className="usage-cost">¥{(tokenTotals.cumulative_usage ?? 0).toFixed(4)}</td>
+                        <td></td>
                       </tr>
                     )}
                   </tbody>
                 </table>
-              </div>
+                  </div>
+                </div>
+              </>
             )}
           </div>
         )}
 
         {activeTab === 'search' && (
-          <div>
+          <div className="config-tab-panel" role="tabpanel">
             {!searchLoaded ? (
-              <p style={{ color: 'var(--megaform-text-secondary)', textAlign: 'center', padding: 24 }}>{t('loading')}</p>
+              <div className="config-empty-state"><Loader size={18} className="config-spinner" />{t('loading')}</div>
             ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <div className="config-stack">
                 {/* 提供商选择 */}
-                <div>
-                  <label style={{ fontSize: 13, fontWeight: 500, marginBottom: 6, display: 'block', color: 'var(--megaform-text-secondary)' }}>
-                    {t('searchProvider')}
-                  </label>
-                  <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 8 }}>
+                <section className="config-section-card">
+                  <div className="config-section-heading">
+                    <div>
+                      <h3>{t('searchProvider')}</h3>
+                      <p>{activeLanguage === 'en' ? 'Choose the service used for online retrieval' : '选择用于联网检索的服务'}</p>
+                    </div>
+                  </div>
+                  <div className="search-provider-grid">
                     {searchProviders.map((sp) => (
-                      <div
+                      <button
+                        type="button"
                         key={sp.id}
                         onClick={() => {
                           setSearchProvider(sp.id);
                           setSearchBaseUrl(sp.base_url);
                         }}
-                        className={`model-preset-card${searchProvider === sp.id ? ' selected' : ''}`}
-                        style={{ cursor: 'pointer', padding: 10, fontSize: 13 }}
+                        className={`search-provider-card${searchProvider === sp.id ? ' selected' : ''}`}
                         title={localizeSearchProviderText(sp.api_key_hint, activeLanguage)}
+                        aria-pressed={searchProvider === sp.id}
                       >
-                        <div style={{ fontWeight: 500 }}>{localizeSearchProviderText(sp.name, activeLanguage)}</div>
-                        <div style={{ fontSize: 11, color: 'var(--megaform-text-secondary)', marginTop: 2 }}>{localizeSearchProviderText(sp.free_tier, activeLanguage)}</div>
-                        <div style={{ fontSize: 11, color: 'var(--megaform-text-secondary)' }}>{localizeSearchProviderText(sp.pricing, activeLanguage)}</div>
-                      </div>
+                        <span className="search-provider-check"><CheckCircle2 size={15} /></span>
+                        <strong>{localizeSearchProviderText(sp.name, activeLanguage)}</strong>
+                        <span>{localizeSearchProviderText(sp.free_tier, activeLanguage)}</span>
+                        <span>{localizeSearchProviderText(sp.pricing, activeLanguage)}</span>
+                      </button>
                     ))}
                   </div>
-                </div>
+                </section>
 
-                {/* API Key */}
-                <div>
-                  <label style={{ fontSize: 13, fontWeight: 500, marginBottom: 4, display: 'block', color: 'var(--megaform-text-secondary)' }}>
-                    API Key
-                  </label>
-                  <input
-                    type="password"
-                    value={searchApiKey}
-                    onChange={e => setSearchApiKey(e.target.value)}
-                    placeholder={
-                      localizeSearchProviderText(searchProviders.find(sp => sp.id === searchProvider)?.api_key_hint || t('apiKeyPlaceholder'), activeLanguage)
-                    }
-                    className="config-input"
-                    style={{ width: '100%', fontFamily: 'monospace', fontSize: 13 }}
-                  />
-                </div>
-
-                {/* Base URL (可编辑) */}
-                <div>
-                  <label style={{ fontSize: 13, fontWeight: 500, marginBottom: 4, display: 'block', color: 'var(--megaform-text-secondary)' }}>
-                    {t('apiUrl')}
-                  </label>
-                  <input
-                    type="text"
-                    value={searchBaseUrl}
-                    onChange={e => setSearchBaseUrl(e.target.value)}
-                    placeholder="https://..."
-                    className="config-input"
-                    style={{ width: '100%', fontFamily: 'monospace', fontSize: 13 }}
-                  />
-                </div>
+                <section className="config-section-card">
+                  <div className="config-section-heading">
+                    <div>
+                      <h3>{activeLanguage === 'en' ? 'Connection' : '连接信息'}</h3>
+                      <p>{activeLanguage === 'en' ? 'Credentials are stored only in your service settings' : '凭证仅保存在你的服务设置中'}</p>
+                    </div>
+                  </div>
+                  <div className="config-form-grid">
+                    <label className="config-field">
+                      <span>API Key</span>
+                      <input
+                        type="password"
+                        value={searchApiKey}
+                        onChange={e => setSearchApiKey(e.target.value)}
+                        placeholder={
+                          localizeSearchProviderText(searchProviders.find(sp => sp.id === searchProvider)?.api_key_hint || t('apiKeyPlaceholder'), activeLanguage)
+                        }
+                        className="config-input config-mono-input"
+                      />
+                    </label>
+                    <label className="config-field">
+                      <span>{t('apiUrl')}</span>
+                      <input
+                        type="text"
+                        value={searchBaseUrl}
+                        onChange={e => setSearchBaseUrl(e.target.value)}
+                        placeholder="https://..."
+                        className="config-input config-mono-input"
+                      />
+                    </label>
+                  </div>
+                </section>
 
                 {/* Save */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div className="config-actions">
                   <button
+                    type="button"
                     onClick={saveSearchConfig}
                     disabled={searchSaving || !searchProvider}
-                    className="model-chip active"
-                    style={{ fontWeight: 500 }}
+                    className="btn btn-primary"
                   >
                     {searchSaving ? t('saving') : t('saveSearchConfig')}
                   </button>
                   {searchSaved && (
-                    <span style={{ color: 'var(--megaform-stone-600)', fontSize: 13 }}><CheckCircle2 size={13} style={{verticalAlign:'-2px',marginRight:3}} /> {t('saved')}</span>
+                    <span className="config-saved"><CheckCircle2 size={14} /> {t('saved')}</span>
                   )}
                 </div>
               </div>
@@ -1220,81 +1301,94 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
         )}
 
         {activeTab === 'mineru' && (
-          <div>
+          <div className="config-tab-panel" role="tabpanel">
             {!mineruLoaded ? (
-              <p style={{ color: 'var(--megaform-text-secondary)', textAlign: 'center', padding: 24 }}>{t('loading')}</p>
+              <div className="config-empty-state"><Loader size={18} className="config-spinner" />{t('loading')}</div>
             ) : (
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                <div>
-                  <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--megaform-text)', marginBottom: 4 }}>
-                    MinerU PDF
-                  </div>
-                  <div style={{ fontSize: 12, color: 'var(--megaform-text-secondary)' }}>
+              <div className="config-stack">
+                <section className="config-service-hero">
+                  <span className="config-service-icon"><FileText size={20} /></span>
+                  <div>
+                    <h3>MinerU PDF</h3>
+                    <p>
                     {activeLanguage === 'en'
                       ? 'Used by the PDF upload button to convert papers into Markdown responses.'
                       : '用于输入栏 PDF 上传入口，把论文转成 Markdown response。'}
+                    </p>
                   </div>
-                </div>
+                </section>
 
-                <div>
-                  <label style={{ fontSize: 13, fontWeight: 500, marginBottom: 4, display: 'block', color: 'var(--megaform-text-secondary)' }}>
-                    MinerU API Key
-                  </label>
-                  <input
-                    type="password"
-                    value={mineruApiKey}
-                    onChange={e => setMineruApiKey(e.target.value)}
-                    placeholder={activeLanguage === 'en' ? 'MinerU API token' : 'MinerU 官网申请的 API Token'}
-                    className="config-input"
-                    style={{ width: '100%', fontFamily: 'monospace', fontSize: 13 }}
-                  />
-                </div>
+                <section className="config-section-card">
+                  <div className="config-section-heading">
+                    <div>
+                      <h3>{activeLanguage === 'en' ? 'Service configuration' : '服务配置'}</h3>
+                      <p>{activeLanguage === 'en' ? 'Set the API credential and parsing engine' : '设置 API 凭证与解析引擎'}</p>
+                    </div>
+                  </div>
+                  <div className="config-form-grid">
+                    <label className="config-field config-field-wide">
+                      <span>MinerU API Key</span>
+                      <input
+                        type="password"
+                        className="config-input"
+                        value={mineruApiKey}
+                        onChange={e => setMineruApiKey(e.target.value)}
+                        placeholder={activeLanguage === 'en' ? 'MinerU API token' : 'MinerU 官网申请的 API Token'}
+                      />
+                    </label>
+                    <label className="config-field">
+                      <span>{activeLanguage === 'en' ? 'Model' : '模型'}</span>
+                      <select className="config-input" value={mineruModelVersion} onChange={e => setMineruModelVersion(e.target.value)}>
+                        <option value="vlm">vlm</option>
+                        <option value="pipeline">pipeline</option>
+                      </select>
+                    </label>
+                    <label className="config-field">
+                      <span>{activeLanguage === 'en' ? 'Language' : '语言'}</span>
+                      <input
+                        className="config-input"
+                        value={mineruLanguage}
+                        onChange={e => setMineruLanguage(e.target.value)}
+                        placeholder="ch / en"
+                      />
+                    </label>
+                  </div>
+                </section>
 
-                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10 }}>
-                  <label style={{ fontSize: 13, color: 'var(--megaform-text-secondary)' }}>
-                    <span style={{ display: 'block', marginBottom: 4 }}>{activeLanguage === 'en' ? 'Model' : '模型'}</span>
-                    <select className="config-input" value={mineruModelVersion} onChange={e => setMineruModelVersion(e.target.value)}>
-                      <option value="vlm">vlm</option>
-                      <option value="pipeline">pipeline</option>
-                    </select>
-                  </label>
-                  <label style={{ fontSize: 13, color: 'var(--megaform-text-secondary)' }}>
-                    <span style={{ display: 'block', marginBottom: 4 }}>{activeLanguage === 'en' ? 'Language' : '语言'}</span>
-                    <input
-                      className="config-input"
-                      value={mineruLanguage}
-                      onChange={e => setMineruLanguage(e.target.value)}
-                      placeholder="ch / en"
-                    />
-                  </label>
-                </div>
+                <section className="config-section-card">
+                  <div className="config-section-heading">
+                    <div>
+                      <h3>{activeLanguage === 'en' ? 'Recognition options' : '识别选项'}</h3>
+                      <p>{activeLanguage === 'en' ? 'Enable only the content types you need' : '按需开启需要处理的内容类型'}</p>
+                    </div>
+                  </div>
+                  <div className="config-option-grid">
+                    <label className="config-check-card">
+                      <input type="checkbox" checked={mineruEnableFormula} onChange={e => setMineruEnableFormula(e.target.checked)} />
+                      <span>{activeLanguage === 'en' ? 'Formula recognition' : '公式识别'}</span>
+                    </label>
+                    <label className="config-check-card">
+                      <input type="checkbox" checked={mineruEnableTable} onChange={e => setMineruEnableTable(e.target.checked)} />
+                      <span>{activeLanguage === 'en' ? 'Table recognition' : '表格识别'}</span>
+                    </label>
+                    <label className="config-check-card">
+                      <input type="checkbox" checked={mineruIsOcr} onChange={e => setMineruIsOcr(e.target.checked)} />
+                      <span>OCR</span>
+                    </label>
+                  </div>
+                </section>
 
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 12, fontSize: 13, color: 'var(--megaform-text-secondary)' }}>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
-                    <input type="checkbox" checked={mineruEnableFormula} onChange={e => setMineruEnableFormula(e.target.checked)} />
-                    {activeLanguage === 'en' ? 'Formula recognition' : '公式识别'}
-                  </label>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
-                    <input type="checkbox" checked={mineruEnableTable} onChange={e => setMineruEnableTable(e.target.checked)} />
-                    {activeLanguage === 'en' ? 'Table recognition' : '表格识别'}
-                  </label>
-                  <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, whiteSpace: 'nowrap' }}>
-                    <input type="checkbox" checked={mineruIsOcr} onChange={e => setMineruIsOcr(e.target.checked)} />
-                    OCR
-                  </label>
-                </div>
-
-                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div className="config-actions">
                   <button
+                    type="button"
                     onClick={saveMineruConfig}
                     disabled={mineruSaving}
-                    className="model-chip active"
-                    style={{ fontWeight: 500 }}
+                    className="btn btn-primary"
                   >
                     {mineruSaving ? t('saving') : (activeLanguage === 'en' ? 'Save MinerU config' : '保存 MinerU 配置')}
                   </button>
                   {mineruSaved && (
-                    <span style={{ color: 'var(--megaform-stone-600)', fontSize: 13 }}><CheckCircle2 size={13} style={{verticalAlign:'-2px',marginRight:3}} /> {t('saved')}</span>
+                    <span className="config-saved"><CheckCircle2 size={14} /> {t('saved')}</span>
                   )}
                 </div>
               </div>
@@ -1303,7 +1397,7 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
         )}
 
         {activeTab === 'account' && (
-          <div className="account-settings">
+          <div className="config-tab-panel account-settings" role="tabpanel">
             <div className="account-settings-card">
               <div className="account-settings-avatar">
                 {currentUser?.avatar_url ? (
@@ -1487,6 +1581,7 @@ export default function ConfigModal({ currentUser, localMode, language, onLangua
             </div>
           </div>
         )}
+        </div>
       </div>
     </div>
   );

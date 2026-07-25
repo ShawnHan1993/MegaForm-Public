@@ -42,6 +42,7 @@ export type Root = Node & {
 export interface RootGroup {
   id: string;
   user_id: string;
+  parent_id: string | null;
   name: string;
   sort_order: number;
   collapsed: number;

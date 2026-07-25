@@ -706,10 +706,17 @@ export const api = {
   // Roots
   /** 获取所有问题树根节点（按分组和组内顺序排序） */
   listRoots: () => request<Root[]>('/roots'),
+  listRootsPage: (params: { limit?: number; cursor?: string | null; updatedAfter?: string | null } = {}) => {
+    const search = new URLSearchParams({ paged: '1' });
+    if (params.limit) search.set('limit', String(params.limit));
+    if (params.cursor) search.set('cursor', params.cursor);
+    if (params.updatedAfter) search.set('updated_after', params.updatedAfter);
+    return request<{ roots: Root[]; next_cursor: string | null; has_more: boolean }>(`/roots?${search.toString()}`);
+  },
   /** 获取侧边栏分组 */
   listRootGroups: () => request<RootGroup[]>('/root-groups'),
   /** 新建侧边栏分组 */
-  createRootGroup: (data: { name: string }) =>
+  createRootGroup: (data: { name: string; parent_id?: string | null }) =>
     request<RootGroup>('/root-groups', {
       method: 'POST',
       body: JSON.stringify(data),

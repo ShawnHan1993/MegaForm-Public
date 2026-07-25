@@ -65,6 +65,15 @@ export function isSupportedImageFile(file: File): boolean {
   return /^image\/(png|jpe?g|webp|gif)$/i.test(file.type);
 }
 
+export function getClipboardImageFile(clipboardData: DataTransfer): File | null {
+  for (const item of Array.from(clipboardData.items)) {
+    if (item.kind !== 'file' || !item.type.toLowerCase().startsWith('image/')) continue;
+    const file = item.getAsFile();
+    if (file) return file;
+  }
+  return Array.from(clipboardData.files).find(file => file.type.toLowerCase().startsWith('image/')) || null;
+}
+
 export function fileToDataUrl(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
